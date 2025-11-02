@@ -94,8 +94,6 @@ public class ChatCommand : CommandWithVariables
         factory.AddFunctions(new CodeExplorationHelperFunctions());
         factory.AddFunctions(new ImageHelperFunctions(this));
         factory.AddFunctions(new ShellAndProcessHelperFunctions());
-        // Add DebugSessionTools (debugging tool skeleton)
-        factory.AddFunctions(new DebugSessionTools());
 
         // Add multi-session debug tools
         factory.AddFunctions(new MultiSessionDebugTools());
