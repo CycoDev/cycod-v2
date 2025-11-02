@@ -7,7 +7,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
 {
     private readonly object _lock = new();
     private readonly Dictionary<string, DebugSession> _sessions = new();
-    private readonly Dictionary<string, RealDapClient> _clients = new();
+    private readonly Dictionary<string, IDapClient> _clients = new();
     private readonly Dictionary<string, List<DebugEventModel>> _events = new();
     private readonly Dictionary<string, List<string>> _outputLines = new();
 
@@ -15,6 +15,10 @@ public class MultiSessionDebugTools : IAsyncDisposable
     private const int MaxEventQueue = 500;
     private const int MaxOutputLines = 2000;
     private const int MaxOutputLineChars = 500;
+
+    private readonly Func<string, Action<Event>, IDapClient> _clientFactory;
+    public MultiSessionDebugTools() : this((adapterPath, cb) => new RealDapClient(adapterPath, cb)) { }
+    public MultiSessionDebugTools(Func<string, Action<Event>, IDapClient> clientFactory) { _clientFactory = clientFactory; }
 
     [Description("Starts a new debug session. Returns session id and adapter path.")]
     public string StartDebugSession(string programPath, string arguments = "", string workingDirectory = "", bool stopAtEntry = false)
@@ -37,7 +41,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
 
             try
             {
-                var client = new RealDapClient(adapterPath, evt => HandleEvent(sessionId, session, evt));
+                var client = _clientFactory(adapterPath, evt => HandleEvent(sessionId, session, evt));
                 _clients[sessionId] = client;
                 var initResp = client.SendRequestAsync(DapProtocol.InitializeCommand, new InitializeRequestArguments()).Result;
                 if (!initResp.Success) return Serialize(new { error = "initialize-failed", message = initResp.Message });
@@ -89,7 +93,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
     }
 
     [ReadOnly(true)]
-    [Description("Returns whether there is a pending critical (stopped) event.")]
+    [Description("Returns whether a pending stopped event exists.")]
     public string HasPendingCriticalEvent(string sessionId)
     {
         lock (_lock)
@@ -208,7 +212,10 @@ public class MultiSessionDebugTools : IAsyncDisposable
                 var scopesBody = DeserializeBody<ScopesResponseBody>(scopesResp.Body); if (scopesBody == null) return Serialize(new { error = "scopes-empty", sessionId });
                 var matchScope = scopesBody.Scopes.FirstOrDefault(s => string.Equals(s.Name, scope, StringComparison.OrdinalIgnoreCase)); if (matchScope == null) return Serialize(new { error = "scope-not-found", scope, sessionId });
                 var varsResp = client.SendRequestAsync(DapProtocol.VariablesCommand, new VariablesArguments { VariablesReference = matchScope.VariablesReference }).Result; if (!varsResp.Success) return Serialize(new { error = "variables-failed", message = varsResp.Message, sessionId });
-                var varsBody = DeserializeBody<VariablesResponseBody>(varsResp.Body); var vars = varsBody?.Variables ?? Array.Empty<Variable>();
+                var varsBody = DeserializeBody<VariablesResponseBody>(varsResp.Body);
+                Cycod.Debugging.Protocol.Variable[] vars;
+                if (varsBody == null) vars = Array.Empty<Cycod.Debugging.Protocol.Variable>();
+                else vars = varsBody.Variables ?? Array.Empty<Cycod.Debugging.Protocol.Variable>();
                 var limited = vars.Take(max).Select(v => new { v.Name, v.Value, v.Type }).ToList();
                 return Serialize(new { status = "ok", sessionId, scope, frameIndex, count = limited.Count, truncated = vars.Length > limited.Count, variables = limited });
             }
@@ -234,8 +241,9 @@ public class MultiSessionDebugTools : IAsyncDisposable
                 var scopesBody = DeserializeBody<ScopesResponseBody>(scopesResp.Body); if (scopesBody == null) return Serialize(new { error = "scopes-empty", sessionId });
                 var matchScope = scopesBody.Scopes.FirstOrDefault(s => string.Equals(s.Name, scope, StringComparison.OrdinalIgnoreCase)); if (matchScope == null) return Serialize(new { error = "scope-not-found", scope, sessionId });
                 var varsResp = client.SendRequestAsync(DapProtocol.VariablesCommand, new VariablesArguments { VariablesReference = matchScope.VariablesReference }).Result; if (!varsResp.Success) return Serialize(new { error = "variables-failed", message = varsResp.Message, sessionId });
-                var varsBody = DeserializeBody<VariablesResponseBody>(varsResp.Body); var vars = varsBody?.Variables ?? Array.Empty<Variable>();
-                var target = vars.FirstOrDefault(v => v.Name == variableName); if (target == null) return Serialize(new { error = "variable-not-found", variableName, sessionId });
+                var varsBody = DeserializeBody<VariablesResponseBody>(varsResp.Body); Cycod.Debugging.Protocol.Variable[] vars;
+                if (varsBody == null) vars = Array.Empty<Cycod.Debugging.Protocol.Variable>();
+                else vars = varsBody.Variables ?? Array.Empty<Cycod.Debugging.Protocol.Variable>(); var target = vars.FirstOrDefault(v => v.Name == variableName); if (target == null) return Serialize(new { error = "variable-not-found", variableName, sessionId });
                 var setResp = client.SendRequestAsync(DapProtocol.SetVariableCommand, new SetVariableArguments { VariablesReference = matchScope.VariablesReference, Name = variableName, Value = newValue }).Result; if (!setResp.Success) return Serialize(new { error = "setvariable-failed", message = setResp.Message, sessionId });
                 return Serialize(new { status = "ok", sessionId, variable = variableName, oldValue = target.Value, newValue });
             }
@@ -268,7 +276,6 @@ public class MultiSessionDebugTools : IAsyncDisposable
         }
     }
 
-    // --- Internal helpers ---
     private string PerformStep(string sessionId, string command, string errorKey)
     {
         lock (_lock)
@@ -293,7 +300,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
         }
     }
 
-    private (bool verified, string? message) SyncBreakpointsForFile(DebugSession session, RealDapClient client, string file)
+    private (bool verified, string? message) SyncBreakpointsForFile(DebugSession session, IDapClient client, string file)
     {
         var lines = session.Breakpoints.TryGetValue(file, out var set) ? set.ToArray() : Array.Empty<int>();
         var bps = lines.Select(l => new SourceBreakpoint { Line = l }).ToArray();
@@ -322,11 +329,8 @@ public class MultiSessionDebugTools : IAsyncDisposable
                     var stopped = TryDeserialize<StoppedEventBody>(evt.Body);
                     if (stopped != null)
                     {
-                        model.Reason = stopped.Reason;
-                        model.ThreadId = stopped.ThreadId;
-                        model.Message = stopped.Text;
-                        session.CurrentThreadId = stopped.ThreadId;
-                        session.IsRunning = false;
+                        model.Reason = stopped.Reason; model.ThreadId = stopped.ThreadId; model.Message = stopped.Text;
+                        session.CurrentThreadId = stopped.ThreadId; session.IsRunning = false;
                     }
                     break;
                 case DapProtocol.ThreadEvent:
@@ -337,8 +341,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
                     var output = TryDeserialize<OutputEventBody>(evt.Body);
                     if (output != null && !string.IsNullOrEmpty(output.Output))
                     {
-                        model.Category = output.Category;
-                        model.Output = TruncateLine(output.Output);
+                        model.Category = output.Category; model.Output = TruncateLine(output.Output);
                         if (_outputLines.TryGetValue(sessionId, out var list)) { list.Add(model.Output); if (list.Count > MaxOutputLines) list.RemoveAt(0); }
                     }
                     break;
