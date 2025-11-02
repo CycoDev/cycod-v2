@@ -154,6 +154,81 @@ public class MultiSessionDebugTools : IAsyncDisposable
         }
     }
 
+    [Description("Continues execution for the specified session. Handles initial configuration.")]
+    public string ContinueExecution(string sessionId)
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId });
+            if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId });
+            try
+            {
+                if (!session.IsConfigured)
+                {
+                    // Send configurationDone first run
+                    var cfgResp = client.SendRequestAsync(DapProtocol.ConfigurationDoneCommand, new { }).Result;
+                    if (!cfgResp.Success) return Serialize(new { error = "configuration-failed", message = cfgResp.Message, sessionId });
+                    session.IsConfigured = true;
+                }
+                var contArgs = new ContinueArguments { ThreadId = session.CurrentThreadId.Value };
+                var resp = client.SendRequestAsync(DapProtocol.ContinueCommand, contArgs).Result;
+                if (!resp.Success) return Serialize(new { error = "continue-failed", message = resp.Message, sessionId });
+                session.IsRunning = true;
+                return Serialize(new { status = "ok", sessionId, running = true });
+            }
+            catch (Exception ex)
+            {
+                return Serialize(new { error = "continue-error", message = ex.Message, sessionId });
+            }
+        }
+    }
+
+    [Description("Steps over the current line for the specified session.")]
+    public string StepOver(string sessionId)
+    {
+        return PerformStep(sessionId, DapProtocol.NextCommand, "stepover-failed");
+    }
+
+    [Description("Steps into the next function call for the specified session.")]
+    public string StepIn(string sessionId)
+    {
+        return PerformStep(sessionId, DapProtocol.StepInCommand, "stepin-failed");
+    }
+
+    [Description("Steps out of the current function for the specified session.")]
+    public string StepOut(string sessionId)
+    {
+        return PerformStep(sessionId, DapProtocol.StepOutCommand, "stepout-failed");
+    }
+
+    private string PerformStep(string sessionId, string command, string errorKey)
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId });
+            if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId });
+            try
+            {
+                object args;
+                if (command == DapProtocol.NextCommand) args = new NextArguments { ThreadId = session.CurrentThreadId.Value };
+                else if (command == DapProtocol.StepInCommand) args = new StepInArguments { ThreadId = session.CurrentThreadId.Value };
+                else args = new StepOutArguments { ThreadId = session.CurrentThreadId.Value };
+                var resp = client.SendRequestAsync(command, args).Result;
+                if (!resp.Success) return Serialize(new { error = errorKey, message = resp.Message, sessionId });
+                // After a step the adapter will emit a stopped event; mark running until event changes it
+                session.IsRunning = true;
+                return Serialize(new { status = "ok", sessionId, stepping = command });
+            }
+            catch (Exception ex)
+            {
+                return Serialize(new { error = errorKey, message = ex.Message, sessionId });
+            }
+        }
+    }
+
+
     [Description("Sets a breakpoint for a file and line in the specified session.")]
     public string SetBreakpoint(string sessionId, string filePath, int line, string condition = "")
     {
