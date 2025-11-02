@@ -154,6 +154,74 @@ public class MultiSessionDebugTools : IAsyncDisposable
         }
     }
 
+    [Description("Sets a breakpoint for a file and line in the specified session.")]
+    public string SetBreakpoint(string sessionId, string filePath, int line, string condition = "")
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId });
+            var full = Path.GetFullPath(filePath);
+            if (!File.Exists(full)) return Serialize(new { error = "file-not-found", filePath = full });
+            session.AddBreakpoint(full, line);
+            var result = SyncBreakpointsForFile(session, client, full);
+            return Serialize(new { status = "ok", sessionId, file = full, line, verified = result.verified, message = result.message });
+        }
+    }
+
+    [Description("Removes a breakpoint for a file and line in the specified session.")]
+    public string RemoveBreakpoint(string sessionId, string filePath, int line)
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId });
+            var full = Path.GetFullPath(filePath);
+            var removed = session.RemoveBreakpoint(full, line);
+            if (!removed) return Serialize(new { error = "breakpoint-not-found", file = full, line });
+            var result = SyncBreakpointsForFile(session, client, full);
+            return Serialize(new { status = "ok", sessionId, file = full, line, remaining = session.Breakpoints.ContainsKey(full) ? session.Breakpoints[full].Count : 0, verifiedAll = result.verified });
+        }
+    }
+
+    [ReadOnly(true)]
+    [Description("Lists breakpoints for the specified session.")]
+    public string ListBreakpoints(string sessionId)
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId });
+            var list = session.GetAllBreakpoints().Select(b => new { b.file, b.line });
+            return Serialize(new { status = "ok", sessionId, breakpoints = list });
+        }
+    }
+
+    private (bool verified, string? message) SyncBreakpointsForFile(DebugSession session, RealDapClient client, string file)
+    {
+        var lines = session.Breakpoints.TryGetValue(file, out var set) ? set.ToArray() : Array.Empty<int>();
+        var bps = lines.Select(l => new SourceBreakpoint { Line = l }).ToArray();
+        var args = new SetBreakpointsArguments
+        {
+            Source = new Source { Name = Path.GetFileName(file), Path = file },
+            Breakpoints = bps
+        };
+        try
+        {
+            var resp = client.SendRequestAsync(DapProtocol.SetBreakpointsCommand, args).Result;
+            if (!resp.Success) return (false, resp.Message);
+            var bodyJson = resp.Body?.ToString();
+            if (bodyJson == null) return (bps.Length == 0, null);
+            var body = JsonSerializer.Deserialize<SetBreakpointsResponseBody>(bodyJson);
+            var allVerified = body?.Breakpoints.All(b => b.Verified) ?? true;
+            return (allVerified, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+
     private void HandleEvent(string sessionId, DebugSession session, Event evt)
     {
         lock (_lock)
