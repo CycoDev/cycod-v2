@@ -97,6 +97,9 @@ public class ChatCommand : CommandWithVariables
         // Add DebugSessionTools (debugging tool skeleton)
         factory.AddFunctions(new DebugSessionTools());
 
+        // Add multi-session debug tools
+        factory.AddFunctions(new MultiSessionDebugTools());
+
         
         // Add MCP functions if any are configured
         await AddMcpFunctions(factory);
