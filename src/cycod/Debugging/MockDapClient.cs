@@ -27,6 +27,22 @@ public class MockDapClient : IDapClient
                 resp.Body = new { launched = true }; break;
             case DapProtocol.ConfigurationDoneCommand:
                 resp.Body = new { configured = true }; break;
+            case DapProtocol.AttachCommand:
+                resp.Body = new { attached = true }; break;
+            case "evaluate":
+                var evalJson = JsonSerializer.Serialize(args);
+                try
+                {
+                    using var doc = JsonDocument.Parse(evalJson);
+                    var expr = doc.RootElement.TryGetProperty("expression", out var eProp) ? eProp.GetString() ?? "" : "";
+                    resp.Body = new { result = expr, type = "string" };
+                }
+                catch
+                {
+                    resp.Success = false;
+                    resp.Message = "invalid-evaluate-args";
+                }
+                break;
             case DapProtocol.SetBreakpointsCommand:
                 var sbArgsJson = JsonSerializer.Serialize(args);
                 var sbArgs = JsonSerializer.Deserialize<SetBreakpointsArguments>(sbArgsJson);
@@ -52,9 +68,11 @@ public class MockDapClient : IDapClient
                 {
                     StackFrames = new[]
                     {
-                        new Cycod.Debugging.Protocol.StackFrame { Id = 100, Name = "Main", Source = new Cycod.Debugging.Protocol.Source { Name = "MockProgram.cs", Path = GetMockSourcePath() }, Line = FirstBreakpointOr(10), Column = 1 }
+                        new Cycod.Debugging.Protocol.StackFrame { Id = 100, Name = "Main", Source = new Cycod.Debugging.Protocol.Source { Name = "MockProgram.cs", Path = GetMockSourcePath() }, Line = FirstBreakpointOr(10), Column = 1 },
+                        new Cycod.Debugging.Protocol.StackFrame { Id = 101, Name = "Helper", Source = new Cycod.Debugging.Protocol.Source { Name = "MockProgram.cs", Path = GetMockSourcePath() }, Line = FirstBreakpointOr(12), Column = 1 },
+                        new Cycod.Debugging.Protocol.StackFrame { Id = 102, Name = "Utility", Source = new Cycod.Debugging.Protocol.Source { Name = "MockProgram.cs", Path = GetMockSourcePath() }, Line = FirstBreakpointOr(14), Column = 1 }
                     },
-                    TotalFrames = 1
+                    TotalFrames = 3
                 };
                 break;
             case DapProtocol.ScopesCommand:

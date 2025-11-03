@@ -92,6 +92,40 @@ public class MultiSessionDebugTools : IAsyncDisposable
         }
     }
 
+
+    [Description("Attaches to an existing process id. Returns session id and adapter path.")]
+
+    public string AttachDebugSession(int processId, bool stopAtEntry = false, string workingDirectory = "")
+    {
+        lock (_lock)
+        {
+            if (_sessions.Count >= MaxSessions) return Serialize(new { error = "max-sessions-reached", limit = MaxSessions });
+            if (processId <= 0) return Serialize(new { error = "attach-processid-required", message = "processId must be > 0" });
+            string adapterPath;
+            try { adapterPath = DebugAdapterLocator.FindNetcoredbg(); }
+            catch (Exception ex) { return Serialize(new { error = "adapter-not-found", message = ex.Message }); }
+            var sessionId = Guid.NewGuid().ToString("N");
+            var session = new DebugSession { SessionId = sessionId };
+            _sessions[sessionId] = session;
+            _events[sessionId] = new List<DebugEventModel>();
+            _outputLines[sessionId] = new List<string>();
+            try
+            {
+                var client = _clientFactory(adapterPath, evt => HandleEvent(sessionId, session, evt));
+                _clients[sessionId] = client;
+                var initResp = client.SendRequestAsync(DapProtocol.InitializeCommand, new InitializeRequestArguments()).Result;
+                if (!initResp.Success) return Serialize(new { error = "initialize-failed", sessionId, message = initResp.Message });
+                session.IsInitialized = true;
+                var attachResp = client.SendRequestAsync(DapProtocol.AttachCommand, new AttachRequestArguments { ProcessId = processId, Cwd = workingDirectory, StopAtEntry = stopAtEntry }).Result;
+                if (!attachResp.Success) return Serialize(new { error = "attach-failed", sessionId, message = attachResp.Message });
+                session.IsLaunched = true; // treat as launched
+                session.IsRunning = true;
+                return Serialize(new { status = "ok", sessionId, adapterPath, processId });
+            }
+            catch (Exception ex) { return Serialize(new { error = "attach-failed", sessionId, message = ex.Message }); }
+        }
+    }
+
     [ReadOnly(true)]
     [Description("Returns whether a pending stopped event exists.")]
     public string HasPendingCriticalEvent(string sessionId)
@@ -117,6 +151,77 @@ public class MultiSessionDebugTools : IAsyncDisposable
             return Serialize(new { status = "ok", sessionId, fromIndex = clampedFrom, nextIndex = clampedFrom + slice.Count, totalLines = lines.Count, lines = slice });
         }
     }
+
+    [Description("Gets a source snippet around current frame (alias).")]
+    public string GetCurrentFrameSourceSnippet(string sessionId, int frameIndex = 0, int radius = 5) => GetSourceSnippet(sessionId, frameIndex, radius);
+
+
+    [Description("Gets current stack frames up to levels limit.")]
+    public string GetStackFrames(string sessionId, int levels = 50)
+    {
+        lock (_lock)
+        {
+            if (levels <= 0) levels = 1; if (levels > 200) levels = 200;
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId, message = "Session not found" });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId, message = "Client missing" });
+            if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId, message = "No current thread id" });
+            try
+            {
+                var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = levels }).Result;
+                if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", sessionId, message = stResp.Message });
+                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body);
+                if (stBody == null) return Serialize(new { error = "stacktrace-empty", sessionId, message = "Empty stackTrace body" });
+                var frames = stBody.StackFrames.Select((f, i) => new { index = i, function = f.Name, file = f.Source?.Path, line = f.Line, column = f.Column }).ToList();
+                return Serialize(new { status = "ok", sessionId, totalFrames = stBody.TotalFrames, frames });
+            }
+            catch (Exception ex) { return Serialize(new { error = "stacktrace-error", sessionId, message = ex.Message }); }
+        }
+    }
+
+
+    [Description("Evaluates an expression in the current frame context.")]
+
+    public string EvaluateExpression(string sessionId, string expression, int frameIndex = 0, string context = "repl")
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId, message = "Session not found" });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId, message = "Client missing" });
+            if (session.IsRunning) return Serialize(new { error = "not-stopped", sessionId, message = "Session must be stopped to evaluate." });
+            if (string.IsNullOrWhiteSpace(expression)) return Serialize(new { error = "evaluate-failed", sessionId, message = "Expression required" });
+            if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId, message = "No current thread id" });
+            try
+            {
+                var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = frameIndex + 1 }).Result;
+                if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", sessionId, message = stResp.Message });
+                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body);
+                if (stBody == null || stBody.StackFrames.Length == 0 || frameIndex >= stBody.StackFrames.Length) return Serialize(new { error = "frame-index-out-of-range", sessionId, message = "Frame index out of range" });
+                var frame = stBody.StackFrames[frameIndex];
+                var evalArgs = new { expression, frameId = frame.Id, context };
+                var evalResp = client.SendRequestAsync(DapProtocol.EvaluateCommand, evalArgs).Result;
+                if (!evalResp.Success)
+                {
+                    var msg = evalResp.Message ?? "evaluation failed";
+                    return Serialize(new { error = "evaluate-failed", sessionId, message = msg });
+                }
+                var bodyJson = evalResp.Body?.ToString();
+                string value = ""; string type = "";
+                if (bodyJson != null)
+                {
+                    try
+                    {
+                        using var doc = System.Text.Json.JsonDocument.Parse(bodyJson);
+                        if (doc.RootElement.TryGetProperty("result", out var r)) value = r.GetString() ?? "";
+                        if (doc.RootElement.TryGetProperty("type", out var t)) type = t.GetString() ?? "";
+                    }
+                    catch { }
+                }
+                return Serialize(new { status = "ok", sessionId, expression, value, type });
+            }
+            catch (Exception ex) { return Serialize(new { error = "evaluate-failed", sessionId, message = ex.Message }); }
+        }
+    }
+
 
     [Description("Sets a breakpoint for a file and line.")]
     public string SetBreakpoint(string sessionId, string filePath, int line, string condition = "")

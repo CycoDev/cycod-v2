@@ -13,6 +13,10 @@ public static class DapProtocol
     public const string StepInCommand = "stepIn";
     public const string StepOutCommand = "stepOut";
     public const string StackTraceCommand = "stackTrace";
+    public const string AttachCommand = "attach";
+    public const string EvaluateCommand = "evaluate";
+
+
     public const string ScopesCommand = "scopes";
     public const string VariablesCommand = "variables";
     public const string SetVariableCommand = "setVariable";
