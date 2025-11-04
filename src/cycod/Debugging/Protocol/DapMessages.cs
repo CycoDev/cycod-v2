@@ -43,6 +43,14 @@ public class InitializeRequestArguments
     [JsonPropertyName("pathFormat")] public string? PathFormat { get; set; } = "path";
 }
 
+public class AttachRequestArguments
+{
+    [JsonPropertyName("processId")] public int ProcessId { get; set; }
+    [JsonPropertyName("cwd")] public string? Cwd { get; set; }
+    [JsonPropertyName("stopAtEntry")] public bool StopAtEntry { get; set; }
+}
+
+
 public class LaunchRequestArguments
 {
     [JsonPropertyName("program")] public string? Program { get; set; }

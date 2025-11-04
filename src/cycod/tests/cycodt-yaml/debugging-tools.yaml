@@ -1,0 +1,118 @@
+name: debugging-tools
+description: End-to-end MultiSessionDebugTools functionality using mock DAP client
+environment:
+  USE_DEBUG_MOCK: "1"
+
+steps:
+  - name: launch session
+    command: |
+      cycod function-call MultiSessionDebugTools.StartDebugSession --arg programPath "./dummy.exe"
+    expect-regex:
+      - '"status":"ok"'
+      - '"sessionId":"[a-f0-9]{32}"'
+
+  - name: get sessions
+    command: |
+      cycod function-call MultiSessionDebugTools.ListSessions
+    expect-regex:
+      - '"sessions":'
+      - '"IsInitialized":true'
+
+  - name: set breakpoint
+    command: |
+      cycod function-call MultiSessionDebugTools.SetBreakpoint --arg sessionId "{{last.sessionId}}" --arg filePath "$(echo $TMPDIR)/MockProgram.cs" --arg line "10"
+    expect-regex:
+      - '"status":"ok"'
+      - '"verified":true'
+
+  - name: list breakpoints
+    command: |
+      cycod function-call MultiSessionDebugTools.ListBreakpoints --arg sessionId "{{last.sessionId}}"
+    expect-regex:
+      - '"breakpoints":'
+      - '"line":10'
+
+  - name: continue
+    command: |
+      cycod function-call MultiSessionDebugTools.ContinueExecution --arg sessionId "{{previous.sessionId}}"
+    expect-regex:
+      - '"running":true'
+
+  - name: has pending critical event
+    command: |
+      cycod function-call MultiSessionDebugTools.HasPendingCriticalEvent --arg sessionId "{{previous.sessionId}}"
+    expect-regex:
+      - '"hasCritical":true'
+
+  - name: pending events
+    command: |
+      cycod function-call MultiSessionDebugTools.GetPendingDebugEvents --arg sessionId "{{previous.sessionId}}"
+    expect-regex:
+      - '"events":'
+      - '"stopped"'
+
+  - name: stack frames
+    command: |
+      cycod function-call MultiSessionDebugTools.GetStackFrames --arg sessionId "{{previous.sessionId}}" --arg levels "3"
+    expect-regex:
+      - '"totalFrames":3'
+      - '"function":"Main"'
+      - '"function":"Helper"'
+
+  - name: list variables
+    command: |
+      cycod function-call MultiSessionDebugTools.ListVariables --arg sessionId "{{previous.sessionId}}" --arg scope "locals"
+    expect-regex:
+      - '"variables":'
+      - '"Name":"x"'
+      - '"Value":"10"'
+
+  - name: set variable
+    command: |
+      cycod function-call MultiSessionDebugTools.SetVariable --arg sessionId "{{previous.sessionId}}" --arg variableName "x" --arg newValue "99"
+    expect-regex:
+      - '"status":"ok"'
+      - '"variable":"x"'
+      - '"newValue":"99"'
+
+  - name: confirm variable change
+    command: |
+      cycod function-call MultiSessionDebugTools.ListVariables --arg sessionId "{{previous.sessionId}}" --arg scope "locals"
+    expect-regex:
+      - '"Value":"99"'
+
+  - name: evaluate expression
+    command: |
+      cycod function-call MultiSessionDebugTools.EvaluateExpression --arg sessionId "{{previous.sessionId}}" --arg expression "x + y"
+    expect-regex:
+      - '"status":"ok"'
+      - '"expression":"x + y"'
+      - '"type":"string"'
+
+  - name: source snippet
+    command: |
+      cycod function-call MultiSessionDebugTools.GetCurrentFrameSourceSnippet --arg sessionId "{{previous.sessionId}}" --arg frameIndex "0" --arg radius "3"
+    expect-regex:
+      - '"snippet":'
+      - '"CenterLine":'
+      - '"Lines":'
+
+  - name: remove breakpoint
+    command: |
+      cycod function-call MultiSessionDebugTools.RemoveBreakpoint --arg sessionId "{{previous.sessionId}}" --arg filePath "$(echo $TMPDIR)/MockProgram.cs" --arg line "10"
+    expect-regex:
+      - '"status":"ok"'
+      - '"remaining":0'
+
+  - name: stop session
+    command: |
+      cycod function-call MultiSessionDebugTools.StopDebugSession --arg sessionId "{{previous.sessionId}}"
+    expect-regex:
+      - '"status":"stopped"'
+
+cleanup:
+  - name: verify no active sessions
+    command: |
+      cycod function-call MultiSessionDebugTools.ListSessions
+    expect-regex:
+      - '"sessions":[]'

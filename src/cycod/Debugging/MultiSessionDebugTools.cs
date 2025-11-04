@@ -43,14 +43,28 @@ public class MultiSessionDebugTools : IAsyncDisposable
             {
                 var client = _clientFactory(adapterPath, evt => HandleEvent(sessionId, session, evt));
                 _clients[sessionId] = client;
+                string stage = "initialize";
                 var initResp = client.SendRequestAsync(DapProtocol.InitializeCommand, new InitializeRequestArguments()).Result;
-                if (!initResp.Success) return Serialize(new { error = "initialize-failed", message = initResp.Message });
+                if (!initResp.Success) return Serialize(new { error = "initialize-failed", stage, message = initResp.Message });
                 session.IsInitialized = true;
+
+                // Wait for initialized event (non-fatal)
+                stage = "initialized-event";
+                try { var _ = ((RealDapClient)client).WaitForEventAsync(DapProtocol.InitializedEvent, 8000).Result; } catch { /* ignore */ }
+
+                // Send configurationDone before launch
+                stage = "configurationDone";
+                var cfgResp = client.SendRequestAsync(DapProtocol.ConfigurationDoneCommand, new { }).Result;
+                if (!cfgResp.Success) return Serialize(new { error = "configuration-failed", stage, message = cfgResp.Message });
+                session.IsConfigured = true;
+
+                // Launch
+                stage = "launch";
                 var launchResp = client.SendRequestAsync(DapProtocol.LaunchCommand, new LaunchRequestArguments { Program = fullPath, Cwd = string.IsNullOrEmpty(workingDirectory) ? Path.GetDirectoryName(fullPath) : workingDirectory, StopAtEntry = stopAtEntry }).Result;
-                if (!launchResp.Success) return Serialize(new { error = "launch-failed", message = launchResp.Message });
+                if (!launchResp.Success) return Serialize(new { error = "launch-failed", stage, message = launchResp.Message });
                 session.IsLaunched = true;
                 session.IsRunning = true;
-                return Serialize(new { status = "ok", sessionId, adapterPath, programPath = fullPath });
+                return Serialize(new { status = "ok", sessionId, adapterPath, programPath = fullPath, stage });
             }
             catch (Exception ex) { return Serialize(new { error = "start-failed", message = ex.Message }); }
         }
@@ -113,14 +127,25 @@ public class MultiSessionDebugTools : IAsyncDisposable
             {
                 var client = _clientFactory(adapterPath, evt => HandleEvent(sessionId, session, evt));
                 _clients[sessionId] = client;
+                string stage = "initialize";
                 var initResp = client.SendRequestAsync(DapProtocol.InitializeCommand, new InitializeRequestArguments()).Result;
-                if (!initResp.Success) return Serialize(new { error = "initialize-failed", sessionId, message = initResp.Message });
+                if (!initResp.Success) return Serialize(new { error = "initialize-failed", sessionId, stage, message = initResp.Message });
                 session.IsInitialized = true;
+
+                stage = "initialized-event";
+                try { var _ = ((RealDapClient)client).WaitForEventAsync(DapProtocol.InitializedEvent, 8000).Result; } catch { /* ignore */ }
+
+                stage = "configurationDone";
+                var cfgResp = client.SendRequestAsync(DapProtocol.ConfigurationDoneCommand, new { }).Result;
+                if (!cfgResp.Success) return Serialize(new { error = "configuration-failed", sessionId, stage, message = cfgResp.Message });
+                session.IsConfigured = true;
+
+                stage = "attach";
                 var attachResp = client.SendRequestAsync(DapProtocol.AttachCommand, new AttachRequestArguments { ProcessId = processId, Cwd = workingDirectory, StopAtEntry = stopAtEntry }).Result;
-                if (!attachResp.Success) return Serialize(new { error = "attach-failed", sessionId, message = attachResp.Message });
-                session.IsLaunched = true; // treat as launched
+                if (!attachResp.Success) return Serialize(new { error = "attach-failed", sessionId, stage, message = attachResp.Message });
+                session.IsLaunched = true;
                 session.IsRunning = true;
-                return Serialize(new { status = "ok", sessionId, adapterPath, processId });
+                return Serialize(new { status = "ok", sessionId, adapterPath, processId, stage });
             }
             catch (Exception ex) { return Serialize(new { error = "attach-failed", sessionId, message = ex.Message }); }
         }
@@ -167,11 +192,8 @@ public class MultiSessionDebugTools : IAsyncDisposable
             if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId, message = "No current thread id" });
             try
             {
-                var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = levels }).Result;
-                if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", sessionId, message = stResp.Message });
-                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body);
-                if (stBody == null) return Serialize(new { error = "stacktrace-empty", sessionId, message = "Empty stackTrace body" });
-                var frames = stBody.StackFrames.Select((f, i) => new { index = i, function = f.Name, file = f.Source?.Path, line = f.Line, column = f.Column }).ToList();
+                if (!TryGetStackTrace(sessionId, levels, out var stBody, out var err)) return Serialize(err!);
+                var frames = stBody!.StackFrames.Select((f, i) => new { index = i, function = f.Name, file = f.Source?.Path, line = f.Line, column = f.Column }).ToList();
                 return Serialize(new { status = "ok", sessionId, totalFrames = stBody.TotalFrames, frames });
             }
             catch (Exception ex) { return Serialize(new { error = "stacktrace-error", sessionId, message = ex.Message }); }
@@ -192,12 +214,8 @@ public class MultiSessionDebugTools : IAsyncDisposable
             if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId, message = "No current thread id" });
             try
             {
-                var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = frameIndex + 1 }).Result;
-                if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", sessionId, message = stResp.Message });
-                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body);
-                if (stBody == null || stBody.StackFrames.Length == 0 || frameIndex >= stBody.StackFrames.Length) return Serialize(new { error = "frame-index-out-of-range", sessionId, message = "Frame index out of range" });
-                var frame = stBody.StackFrames[frameIndex];
-                var evalArgs = new { expression, frameId = frame.Id, context };
+                if (!TryGetFrame(sessionId, frameIndex, out var frame, out var err)) return Serialize(err!); frame = frame!;
+                var evalArgs = new { expression, frameId = frame!.Id, context };
                 var evalResp = client.SendRequestAsync(DapProtocol.EvaluateCommand, evalArgs).Result;
                 if (!evalResp.Success)
                 {
@@ -274,12 +292,8 @@ public class MultiSessionDebugTools : IAsyncDisposable
             if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId });
             try
             {
-                if (!session.IsConfigured)
-                {
-                    var cfgResp = client.SendRequestAsync(DapProtocol.ConfigurationDoneCommand, new { }).Result;
-                    if (!cfgResp.Success) return Serialize(new { error = "configuration-failed", message = cfgResp.Message, sessionId });
-                    session.IsConfigured = true;
-                }
+                // configurationDone now sent during Start/Attach handshake; no-op here
+                if (!session.IsConfigured) return Serialize(new { error = "not-configured", sessionId, message = "Session not configured (handshake failed)" });
                 var resp = client.SendRequestAsync(DapProtocol.ContinueCommand, new ContinueArguments { ThreadId = session.CurrentThreadId.Value }).Result;
                 if (!resp.Success) return Serialize(new { error = "continue-failed", message = resp.Message, sessionId });
                 session.IsRunning = true;
@@ -307,11 +321,8 @@ public class MultiSessionDebugTools : IAsyncDisposable
             if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId });
             try
             {
-                var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = frameIndex + 1 }).Result;
-                if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", message = stResp.Message, sessionId });
-                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body);
-                if (stBody == null || stBody.StackFrames.Length == 0 || frameIndex >= stBody.StackFrames.Length) return Serialize(new { error = "frame-index-out-of-range", sessionId, frameIndex });
-                var frame = stBody.StackFrames[frameIndex];
+                if (!TryGetFrame(sessionId, frameIndex, out var frame, out var err)) return err is string ? (string)err : Serialize(err!);
+                frame = frame!;
                 var scopesResp = client.SendRequestAsync(DapProtocol.ScopesCommand, new ScopesArguments { FrameId = frame.Id }).Result;
                 if (!scopesResp.Success) return Serialize(new { error = "scopes-failed", message = scopesResp.Message, sessionId });
                 var scopesBody = DeserializeBody<ScopesResponseBody>(scopesResp.Body); if (scopesBody == null) return Serialize(new { error = "scopes-empty", sessionId });
@@ -340,8 +351,8 @@ public class MultiSessionDebugTools : IAsyncDisposable
             {
                 var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = frameIndex + 1 }).Result;
                 if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", message = stResp.Message, sessionId });
-                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body); if (stBody == null || stBody.StackFrames.Length == 0 || frameIndex >= stBody.StackFrames.Length) return Serialize(new { error = "frame-index-out-of-range", sessionId, frameIndex });
-                var frame = stBody.StackFrames[frameIndex];
+                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body)!; if (stBody == null || stBody.StackFrames.Length == 0 || frameIndex >= stBody.StackFrames.Length) return Serialize(new { error = "frame-index-out-of-range", sessionId, frameIndex });
+                var frame = stBody.StackFrames[frameIndex]!;
                 var scopesResp = client.SendRequestAsync(DapProtocol.ScopesCommand, new ScopesArguments { FrameId = frame.Id }).Result; if (!scopesResp.Success) return Serialize(new { error = "scopes-failed", message = scopesResp.Message, sessionId });
                 var scopesBody = DeserializeBody<ScopesResponseBody>(scopesResp.Body); if (scopesBody == null) return Serialize(new { error = "scopes-empty", sessionId });
                 var matchScope = scopesBody.Scopes.FirstOrDefault(s => string.Equals(s.Name, scope, StringComparison.OrdinalIgnoreCase)); if (matchScope == null) return Serialize(new { error = "scope-not-found", scope, sessionId });
@@ -368,11 +379,9 @@ public class MultiSessionDebugTools : IAsyncDisposable
             if (session.CurrentThreadId == null) return Serialize(new { error = "no-thread-id", sessionId });
             try
             {
-                var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = frameIndex + 1 }).Result;
-                if (!stResp.Success) return Serialize(new { error = "stacktrace-failed", message = stResp.Message, sessionId });
-                var stBody = DeserializeBody<StackTraceResponseBody>(stResp.Body); if (stBody == null || stBody.StackFrames.Length == 0 || frameIndex >= stBody.StackFrames.Length) return Serialize(new { error = "frame-index-out-of-range", sessionId, frameIndex });
-                var frame = stBody.StackFrames[frameIndex]; var file = frame.Source?.Path; if (string.IsNullOrEmpty(file) || !File.Exists(file)) return Serialize(new { error = "file-not-found", file });
-                var allLines = File.ReadAllLines(file); var center = frame.Line; var start = Math.Max(1, center - radius); var end = Math.Min(allLines.Length, center + radius);
+                if (!TryGetFrame(sessionId, frameIndex, out var frame, out var err)) return err is string ? (string)err : Serialize(err!);
+                var file = frame!.Source?.Path; if (string.IsNullOrEmpty(file) || !File.Exists(file)) return Serialize(new { error = "file-not-found", file });
+                var allLines = File.ReadAllLines(file); var center = frame!.Line; var start = Math.Max(1, center - radius); var end = Math.Min(allLines.Length, center + radius);
                 var snippet = new SourceSnippetModel { File = file, FileName = Path.GetFileName(file), CenterLine = center, StartLine = start, EndLine = end, Radius = radius, RadiusClamped = radius > 50, HighlightIndex = center - start };
                 for (int lineNum = start; lineNum <= end; lineNum++) snippet.Lines.Add(new SourceSnippetLine { Line = lineNum, Text = allLines[lineNum - 1] });
                 return Serialize(new { status = "ok", sessionId, snippet });
@@ -408,6 +417,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
     private (bool verified, string? message) SyncBreakpointsForFile(DebugSession session, IDapClient client, string file)
     {
         var lines = session.Breakpoints.TryGetValue(file, out var set) ? set.ToArray() : Array.Empty<int>();
+
         var bps = lines.Select(l => new SourceBreakpoint { Line = l }).ToArray();
         var args = new SetBreakpointsArguments { Source = new Source { Name = Path.GetFileName(file), Path = file }, Breakpoints = bps };
         try
@@ -436,6 +446,7 @@ public class MultiSessionDebugTools : IAsyncDisposable
                     {
                         model.Reason = stopped.Reason; model.ThreadId = stopped.ThreadId; model.Message = stopped.Text;
                         session.CurrentThreadId = stopped.ThreadId; session.IsRunning = false;
+
                     }
                     break;
                 case DapProtocol.ThreadEvent:
@@ -485,6 +496,50 @@ public class MultiSessionDebugTools : IAsyncDisposable
     }
 
     private string TruncateLine(string line) => line.Length <= MaxOutputLineChars ? line : line.Substring(0, MaxOutputLineChars) + "…";
+    private bool TryGetStackTrace(string sessionId, int levels, out StackTraceResponseBody? body, out object? errorResult)
+    {
+        body = null; errorResult = null;
+        if (!_sessions.TryGetValue(sessionId, out var session)) { errorResult = new { error = "session-not-found", sessionId }; return false; }
+        if (!_clients.TryGetValue(sessionId, out var client)) { errorResult = new { error = "client-not-found", sessionId }; return false; }
+        if (session.CurrentThreadId == null) { errorResult = new { error = "no-thread-id", sessionId }; return false; }
+        try
+        {
+            var stResp = client.SendRequestAsync(DapProtocol.StackTraceCommand, new StackTraceArguments { ThreadId = session.CurrentThreadId.Value, Levels = levels }).Result;
+            if (!stResp.Success) { errorResult = new { error = "stacktrace-failed", sessionId, message = stResp.Message }; return false; }
+            body = DeserializeBody<StackTraceResponseBody>(stResp.Body);
+            if (body == null) { errorResult = new { error = "stacktrace-empty", sessionId }; return false; }
+            return true;
+        }
+        catch (Exception ex) { errorResult = new { error = "stacktrace-error", sessionId, message = ex.Message }; return false; }
+    }
+
+    private bool TryGetFrame(string sessionId, int frameIndex, out Cycod.Debugging.Protocol.StackFrame? frame, out object? errorResult)
+    {
+        frame = null; errorResult = null;
+        if (!TryGetStackTrace(sessionId, frameIndex + 1, out var body, out errorResult)) return false;
+        if (body == null || body.StackFrames.Length == 0 || frameIndex >= body.StackFrames.Length) { errorResult = new { error = "frame-index-out-of-range", sessionId, message = "Frame index out of range" }; return false; }
+
+        frame = body.StackFrames[frameIndex];
+        return true;
+    }
+
+
+    [Description("Returns debug adapter status for a session.")]
+    public string GetDebugAdapterStatus(string sessionId)
+    {
+        lock (_lock)
+        {
+            if (!_sessions.TryGetValue(sessionId, out var session)) return Serialize(new { error = "session-not-found", sessionId });
+            if (!_clients.TryGetValue(sessionId, out var client)) return Serialize(new { error = "client-not-found", sessionId });
+            var real = client as RealDapClient;
+            var pending = real?.PendingRequestCount ?? 0;
+            var lastMsgAgeMs = real?.LastMessageAgeMs ?? -1;
+            var hasExited = real?.HasExited ?? false;
+            return Serialize(new { status = "ok", sessionId, session.IsInitialized, session.IsLaunched, session.IsRunning, session.IsConfigured, pendingRequests = pending, lastMessageAgeMs = lastMsgAgeMs, adapterExited = hasExited });
+        }
+    }
+
+
     private static string Serialize(object obj) => JsonSerializer.Serialize(obj, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
 
     public ValueTask DisposeAsync()
