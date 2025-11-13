@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CycoTui.Core/CycoTui.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CycoTui.Backend.Unix/CycoTui.Backend.Unix.csproj" />
+    <ProjectReference Include="../CycoTui.Backend.Windows/CycoTui.Backend.Windows.csproj" />
+  </ItemGroup>
+</Project>
