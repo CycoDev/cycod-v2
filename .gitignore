@@ -11,6 +11,14 @@ src/cycodt/obj/
 src/cycodt/bin/
 src/mcp/**/obj/
 src/mcp/**/bin/
+src/CycoTui.Core/**/obj/
+src/CycoTui.Core/**/bin/
+src/CycoTui.Backend.Unix/**/obj/
+src/CycoTui.Backend.Unix/**/bin/
+src/CycoTui.Backend.Windows/**/obj/
+src/CycoTui.Backend.Windows/**/bin/
+src/cycocli/obj/
+src/cycocli/bin/ß
 
 tests/**/bin/
 tests/**/obj/
