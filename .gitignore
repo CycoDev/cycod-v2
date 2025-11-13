@@ -18,7 +18,7 @@ src/CycoTui.Backend.Unix/**/bin/
 src/CycoTui.Backend.Windows/**/obj/
 src/CycoTui.Backend.Windows/**/bin/
 src/cycocli/obj/
-src/cycocli/bin/ß
+src/cycocli/bin/
 
 tests/**/bin/
 tests/**/obj/
