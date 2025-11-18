@@ -21,6 +21,7 @@ internal static class InteractiveMode
     private static Terminal? _terminal;
     private static string? _cachedGitBranch;
     private static string? _cachedCurrentLLM;
+    private static int _assistantMessageStartIndex = -1;
 
     private static readonly List<string> _messages = new();
     // Debug area removed; retaining stub methods only
@@ -325,28 +326,36 @@ internal static class InteractiveMode
                     {
                         if (assistantActive)
                         {
-                            ReplaceOrAppendAssistant("Assistant: " + assistantBuffer.ToString());
-                            assistantBuffer.Clear();
-                            assistantActive = false;
+                            assistantBuffer.Append('\n');
                         }
                         i++;
                         continue;
                     }
                     else
                     {
+                        // Check for "User: " - if found, flush any active assistant response first
+                        if (TryMatchLiteral(scratch, i, read, "User: ", out var advU))
+                        {
+                            if (assistantActive && assistantBuffer.Length > 0)
+                            {
+                                ReplaceOrAppendAssistant("Assistant: " + assistantBuffer.ToString());
+                                assistantBuffer.Clear();
+                                assistantActive = false;
+                            }
+                            // Reset assistant message tracking
+                            lock (_renderLock) { _assistantMessageStartIndex = -1; }
+                            // Suppress raw cycod user prompt; we already show the user's input ourselves.
+                            i += advU;
+                            while (i < read && scratch[i] != '\n' && scratch[i] != '\r') { i++; }
+                            continue;
+                        }
+
                         if (!assistantActive)
                         {
                             if (TryMatchLiteral(scratch, i, read, "Assistant: ", out var advA))
                             {
                                 assistantActive = true;
                                 i += advA;
-                                continue;
-                            }
-                            if (TryMatchLiteral(scratch, i, read, "User: ", out var advU))
-                            {
-                                // Suppress raw cycod user prompt; we already show the user's input ourselves.
-                                i += advU;
-                                while (i < read && scratch[i] != '\n' && scratch[i] != '\r') { i++; }
                                 continue;
                             }
                         }
@@ -426,6 +435,8 @@ internal static class InteractiveMode
             foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
             _styledMessages.Add(styled);
             _messages.Add(raw);
+            // Reset assistant message tracking when adding a new message (typically user input)
+            _assistantMessageStartIndex = -1;
             Render();
         }
     }
@@ -434,21 +445,30 @@ internal static class InteractiveMode
     {
         lock (_renderLock)
         {
-            if (_messages.Count > 0 && _messages[^1].StartsWith("Assistant:"))
+            // Split multi-line messages into separate styled lines
+            var lines = raw.Split('\n');
+
+            // If we have a previous assistant message group, remove it
+            if (_assistantMessageStartIndex >= 0 && _assistantMessageStartIndex < _messages.Count)
             {
-                // Replace last assistant message
-                _messages[^1] = raw;
-                var styled = _styledMessages[^1];
-                styled.Segments.Clear();
-                foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
+                int removeCount = _messages.Count - _assistantMessageStartIndex;
+                _messages.RemoveRange(_assistantMessageStartIndex, removeCount);
+                _styledMessages.RemoveRange(_assistantMessageStartIndex, removeCount);
             }
-            else
+
+            // Mark the start of this assistant message group
+            _assistantMessageStartIndex = _messages.Count;
+
+            // Add new message(s) - one per line
+            foreach (var line in lines)
             {
+                if (string.IsNullOrEmpty(line)) continue;
                 var styled = new StyledLine();
-                foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
+                foreach (var seg in ParseAnsiSegments(line)) styled.Segments.Add(seg);
                 _styledMessages.Add(styled);
-                _messages.Add(raw);
+                _messages.Add(line);
             }
+
             Render();
         }
     }
