@@ -74,13 +74,33 @@ internal static class InteractiveMode
             AddMessage("cycod executable not found. Install with: dotnet tool install -g cycod");
             return;
         }
-        var (fileName, args) = cycodPath.Value;
+        var (rawFile, rawArgs) = cycodPath.Value;
         try
         {
+            string fileName;
+            string arguments;
+            if (!OperatingSystem.IsWindows())
+            {
+                fileName = "script";
+                if (rawFile == "dotnet")
+                {
+                    arguments = $"-q /dev/null dotnet {rawArgs} chat";
+                }
+                else
+                {
+                    arguments = $"-q /dev/null {rawFile} chat";
+                }
+            }
+            else
+            {
+                fileName = rawFile;
+                arguments = (string.IsNullOrEmpty(rawArgs) ? string.Empty : rawArgs + " ") + "chat";
+            }
+
             var psi = new ProcessStartInfo
             {
                 FileName = fileName,
-                Arguments = (string.IsNullOrEmpty(args) ? string.Empty : args + " ") + "chat",
+                Arguments = arguments,
                 UseShellExecute = false,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
@@ -98,11 +118,15 @@ internal static class InteractiveMode
                 AddMessage("Failed to start cycod process");
                 return;
             }
+            _cycodProcess.EnableRaisingEvents = true;
+            _cycodProcess.Exited += (_, __) => AddDebug($"cycod exited: code {_cycodProcess.ExitCode}");
             _cycodStdin = _cycodProcess.StandardInput;
-            Task.Run(() => ReadOutputLoop(_cycodProcess!.StandardOutput));
-            Task.Run(() => ReadOutputLoop(_cycodProcess!.StandardError));
-            AddMessage($"Started cycod interactive session");
+            Task.Run(() => ReadStreamChunked(_cycodProcess!.StandardOutput, false));
+            Task.Run(() => ReadStreamChunked(_cycodProcess!.StandardError, true));
+            AddMessage("Started cycod interactive session");
             AddDebug($"cycod start: {psi.FileName} {psi.Arguments}");
+            // Initial hello similar to daemon sendInitialHello behavior
+            TrySendToCycod("hello");
         }
         catch (Exception ex)
         {
@@ -124,6 +148,7 @@ internal static class InteractiveMode
                 var fileName = c.StartsWith("dotnet ") ? "dotnet" : c;
                 var args = c.StartsWith("dotnet ") ? c.Substring(7) + " --version" : "--version";
                 using var test = Process.Start(new ProcessStartInfo
+
                 {
                     FileName = fileName,
                     Arguments = args,
@@ -161,23 +186,6 @@ internal static class InteractiveMode
         }
     }
 
-    private static void ReadOutputLoop(StreamReader reader)
-    {
-        try
-        {
-            string? line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                if (string.IsNullOrEmpty(line)) continue;
-                AddMessage(line);
-                AddDebug($"recv: {line}");
-            }
-        }
-        catch (Exception ex)
-        {
-            AddMessage($"Output read error: {ex.Message}");
-        }
-    }
     private static void AddDebug(string debug)
     {
         lock (_renderLock)
@@ -188,6 +196,63 @@ internal static class InteractiveMode
         }
     }
 
+
+    private static void ReadStreamChunked(StreamReader reader, bool isError)
+    {
+        try
+        {
+            var buffer = new char[256];
+            var sb = new System.Text.StringBuilder();
+            while (true)
+            {
+                int read = reader.Read(buffer, 0, buffer.Length);
+                if (read <= 0) break;
+                sb.Append(buffer, 0, read);
+                ProcessBufferedText(sb, isError);
+            }
+            if (sb.Length > 0) ProcessBufferedText(sb, isError, flushAll: true);
+        }
+        catch (Exception ex)
+        {
+            AddDebug($"stream error: {ex.Message}");
+        }
+    }
+
+    private static void ProcessBufferedText(System.Text.StringBuilder sb, bool isError, bool flushAll = false)
+    {
+        var text = sb.ToString();
+        int lastNewline = text.LastIndexOf('\n');
+        if (lastNewline == -1 && !flushAll) return;
+        var emitLength = flushAll ? text.Length : lastNewline + 1;
+        var toEmit = text.Substring(0, emitLength);
+        var remainder = text.Substring(emitLength);
+        var lines = toEmit.Split('\n');
+        foreach (var raw in lines)
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.Length == 0) continue;
+            bool isPrompt = line.StartsWith("User:") || line.StartsWith("Assistant:") || line.EndsWith(":");
+            if (isError)
+            {
+                if (isPrompt)
+                {
+                    AddMessage(line);
+                    AddDebug($"prompt(recv): {line}");
+                }
+                else
+                {
+                    AddDebug($"stderr: {line}");
+                }
+            }
+            else
+            {
+                AddMessage(line);
+                AddDebug($"recv: {line}");
+            }
+        }
+        sb.Clear();
+        sb.Append(remainder);
+    }
 
     private static void AddMessage(string message)
     {
@@ -213,6 +278,7 @@ internal static class InteractiveMode
             {
                 AddMessage($"user: {text}");
                 TrySendToCycod(text);
+
             }
         };
 
