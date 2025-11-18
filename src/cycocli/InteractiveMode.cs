@@ -25,46 +25,145 @@ internal static class InteractiveMode
     private static readonly MultiLineInputState _inputState = new();
     private static CompletionState _completionState = CompletionState.CreateInactive();
 
+    // ANSI styled lines
+    private class StyledLine
+    {
+        public List<(string Text, Style Style)> Segments { get; } = new();
+    }
+    private static readonly List<StyledLine> _styledMessages = new();
+
+    private static List<(string Text, Style Style)> ParseAnsiSegments(string input)
+    {
+        var segments = new List<(string Text, Style Style)>();
+        var currentStyle = Style.Empty;
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < input.Length; i++)
+        {
+            char c = input[i];
+            if (c == '\u001b')
+            {
+                if (sb.Length > 0)
+                {
+                    segments.Add((sb.ToString(), currentStyle));
+                    sb.Clear();
+                }
+                // CSI sequence ESC[
+                if (i + 1 < input.Length && input[i + 1] == '[')
+                {
+                    int start = i + 2;
+                    int j = start;
+                    // Find final byte of CSI (any final byte in '@'..'~')
+                    while (j < input.Length && !IsCsiFinalByte(input[j])) j++;
+                    if (j < input.Length)
+                    {
+                        // If it's an SGR ('m'), parse; otherwise skip entire CSI
+                        if (input[j] == 'm')
+                        {
+                            var codesStr = input.Substring(start, j - start);
+                            var codes = codesStr.Split(';', StringSplitOptions.RemoveEmptyEntries);
+                            currentStyle = ApplySgrCodes(currentStyle, codes);
+                        }
+                        i = j; // advance past final byte
+
+                        continue;
+                    }
+                    // Incomplete CSI at end - skip remainder
+                    break;
+                }
+                else if (i + 1 < input.Length && input[i + 1] == ']') // OSC sequence ESC]
+                {
+                    int start = i + 2;
+                    int j = start;
+                    // OSC ends with BEL (0x07) or ESC \
+                    while (j < input.Length && input[j] != '\u0007')
+                    {
+                        if (input[j] == '\u001b' && j + 1 < input.Length && input[j + 1] == '\\')
+                        {
+                            j += 2; // consume ESC \
+                            break;
+                        }
+                        j++;
+                    }
+                    i = j; // skip OSC
+                    continue;
+                }
+                else
+                {
+                    // Single-char escape (ESC=, ESC>) -> skip next char if present
+                    if (i + 1 < input.Length) i++;
+                    continue;
+                }
+            }
+            sb.Append(c);
+        }
+        if (sb.Length > 0) segments.Add((sb.ToString(), currentStyle));
+        return segments;
+    }
+    private static bool IsCsiFinalByte(char c) => c >= '@' && c <= '~';
+
+    private static Style ApplySgrCodes(Style baseStyle, string[] codes)
+    {
+        var style = baseStyle;
+        foreach (var codeStr in codes)
+        {
+            if (!int.TryParse(codeStr, out var code)) continue;
+            switch (code)
+            {
+                case 0: style = Style.Empty; break;
+                case 1: style = style.Add(TextModifier.Bold); break;
+                case 2: style = style.Add(TextModifier.Dim); break;
+                case 7: style = style.Add(TextModifier.Invert); break;
+                case 22: style = RemoveStyleModifiers(style, TextModifier.Bold, TextModifier.Dim); break;
+                case 27: style = RemoveStyleModifiers(style, TextModifier.Invert); break;
+                case >= 30 and <= 37: style = style.WithForeground(MapAnsiColor(code - 30)); break;
+                case >= 90 and <= 97: style = style.WithForeground(MapAnsiColor(code - 90, bright: true)); break;
+            }
+        }
+        return style;
+    }
+
+    private static Style RemoveStyleModifiers(Style style, params TextModifier[] mods)
+    {
+        style = Style.Empty;
+        return style;
+    }
+
+    private static Color MapAnsiColor(int idx, bool bright = false) => idx switch
+    {
+        0 => bright ? Color.Gray : Color.Black,
+        1 => Color.Red,
+        2 => Color.Green,
+        3 => Color.Yellow,
+        4 => Color.Blue,
+        5 => Color.Magenta,
+        6 => Color.Cyan,
+        7 => Color.Gray,
+        _ => Color.Gray
+    };
+
     private static readonly List<CompletionTrigger> _completionTriggers = new()
     {
-        new CompletionTrigger(
-            '@',
-            async () =>
-            {
-                var workspaceRoot = Environment.CurrentDirectory;
-                return await Task.Run(() => WorkspaceFileScanner.ScanFiles(workspaceRoot, maxFiles: 1000));
-            },
-            "Files"
-        ),
-        new CompletionTrigger(
-            '/',
-            async () =>
-            {
-                await Task.CompletedTask;
-                return new List<string> { "exit" };
-            },
-            "Commands"
-        ),
-        new CompletionTrigger(
-            '#',
-            async () =>
-            {
-                await Task.CompletedTask;
-                return new List<string>
-                {
-                    "bug", "feature", "enhancement", "documentation",
-                    "refactor", "test", "performance", "security"
-                };
-            },
-            "Tags"
-        )
+        new CompletionTrigger('@', async () =>
+        {
+            var workspaceRoot = Environment.CurrentDirectory;
+            return await Task.Run(() => WorkspaceFileScanner.ScanFiles(workspaceRoot, maxFiles: 1000));
+        }, "Files"),
+        new CompletionTrigger('/', async () =>
+        {
+            await Task.CompletedTask;
+            return new List<string> { "exit" };
+        }, "Commands"),
+        new CompletionTrigger('#', async () =>
+        {
+            await Task.CompletedTask;
+            return new List<string> { "bug", "feature", "enhancement", "documentation", "refactor", "test", "performance", "security" };
+        }, "Tags")
     };
 
     private static readonly object _renderLock = new();
     private static Process? _cycodProcess;
     private static StreamWriter? _cycodStdin;
 
-    // --- Cycod interactive helpers ---
     private static void StartCycodInteractive()
     {
         if (_cycodProcess != null) return;
@@ -82,14 +181,7 @@ internal static class InteractiveMode
             if (!OperatingSystem.IsWindows())
             {
                 fileName = "script";
-                if (rawFile == "dotnet")
-                {
-                    arguments = $"-q /dev/null dotnet {rawArgs} chat";
-                }
-                else
-                {
-                    arguments = $"-q /dev/null {rawFile} chat";
-                }
+                arguments = rawFile == "dotnet" ? $"-q /dev/null dotnet {rawArgs} chat" : $"-q /dev/null {rawFile} chat";
             }
             else
             {
@@ -125,8 +217,6 @@ internal static class InteractiveMode
             Task.Run(() => ReadStreamChunked(_cycodProcess!.StandardError, true));
             AddMessage("Started cycod interactive session");
             AddDebug($"cycod start: {psi.FileName} {psi.Arguments}");
-            // Initial hello similar to daemon sendInitialHello behavior
-            TrySendToCycod("hello");
         }
         catch (Exception ex)
         {
@@ -136,11 +226,7 @@ internal static class InteractiveMode
 
     private static (string fileName, string args)? ResolveCycodPath()
     {
-        var candidates = new List<string>
-        {
-            "cycod",
-            "dotnet tool run cycod"
-        };
+        var candidates = new List<string> { "cycod", "dotnet tool run cycod" };
         foreach (var c in candidates)
         {
             try
@@ -148,7 +234,6 @@ internal static class InteractiveMode
                 var fileName = c.StartsWith("dotnet ") ? "dotnet" : c;
                 var args = c.StartsWith("dotnet ") ? c.Substring(7) + " --version" : "--version";
                 using var test = Process.Start(new ProcessStartInfo
-
                 {
                     FileName = fileName,
                     Arguments = args,
@@ -196,7 +281,6 @@ internal static class InteractiveMode
         }
     }
 
-
     private static void ReadStreamChunked(StreamReader reader, bool isError)
     {
         try
@@ -224,8 +308,8 @@ internal static class InteractiveMode
         int lastNewline = text.LastIndexOf('\n');
         if (lastNewline == -1 && !flushAll) return;
         var emitLength = flushAll ? text.Length : lastNewline + 1;
-        var toEmit = text.Substring(0, emitLength);
-        var remainder = text.Substring(emitLength);
+        var toEmit = text[..emitLength];
+        var remainder = text[emitLength..];
         var lines = toEmit.Split('\n');
         foreach (var raw in lines)
         {
@@ -236,7 +320,7 @@ internal static class InteractiveMode
             {
                 if (isPrompt)
                 {
-                    AddMessage(line);
+                    AddParsedStyledMessage(line);
                     AddDebug($"prompt(recv): {line}");
                 }
                 else
@@ -246,12 +330,24 @@ internal static class InteractiveMode
             }
             else
             {
-                AddMessage(line);
+                AddParsedStyledMessage(line);
                 AddDebug($"recv: {line}");
             }
         }
         sb.Clear();
         sb.Append(remainder);
+    }
+
+    private static void AddParsedStyledMessage(string raw)
+    {
+        lock (_renderLock)
+        {
+            var styled = new StyledLine();
+            foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
+            _styledMessages.Add(styled);
+            _messages.Add(raw);
+            Render();
+        }
     }
 
     private static void AddMessage(string message)
@@ -263,7 +359,6 @@ internal static class InteractiveMode
         }
     }
 
-    // --- Entry point ---
     public static void Run(CancellationToken cancellationToken)
     {
         _inputState.OnSubmit += text =>
@@ -278,7 +373,6 @@ internal static class InteractiveMode
             {
                 AddMessage($"user: {text}");
                 TrySendToCycod(text);
-
             }
         };
 
@@ -300,11 +394,9 @@ internal static class InteractiveMode
         }
     }
 
-    private static ITerminalBackend CreateBackend()
-    {
-        if (OperatingSystem.IsWindows()) return new CycoTui.Backend.Windows.WindowsTerminalBackend();
-        return new CycoTui.Backend.Unix.UnixTerminalBackend();
-    }
+    private static ITerminalBackend CreateBackend() => OperatingSystem.IsWindows()
+        ? new CycoTui.Backend.Windows.WindowsTerminalBackend()
+        : new CycoTui.Backend.Unix.UnixTerminalBackend();
 
     private static void InputLoop(CancellationToken cancellationToken)
     {
@@ -330,10 +422,7 @@ internal static class InteractiveMode
                 break;
             }
 
-            if (key.Key == ConsoleKey.Q && (key.Modifiers & ConsoleModifiers.Control) != 0)
-            {
-                break;
-            }
+            if (key.Key == ConsoleKey.Q && (key.Modifiers & ConsoleModifiers.Control) != 0) break;
 
             if (_completionState.IsActive)
             {
@@ -385,12 +474,7 @@ internal static class InteractiveMode
         var cursorColumn = _inputState.CursorColumn;
         var triggerChars = _completionTriggers.Select(t => t.TriggerChar);
 
-        var query = CompletionHelper.DetectCompletionQuery(
-            currentLine,
-            cursorColumn,
-            triggerChars,
-            out var triggerColumn,
-            out var foundTriggerChar);
+        var query = CompletionHelper.DetectCompletionQuery(currentLine, cursorColumn, triggerChars, out var triggerColumn, out var foundTriggerChar);
 
         if (query != null)
         {
@@ -412,15 +496,9 @@ internal static class InteractiveMode
                     _completionState = _completionState.ActivateWithError($"Error loading items: {ex.Message}", _inputState.CursorLineIndex, triggerColumn, foundTriggerChar, trigger.Label);
                 }
             }
-            if (!_completionState.IsError)
-            {
-                _completionState = _completionState.UpdateQuery(query);
-            }
+            if (!_completionState.IsError) _completionState = _completionState.UpdateQuery(query);
         }
-        else if (_completionState.IsActive)
-        {
-            _completionState = _completionState.Deactivate();
-        }
+        else if (_completionState.IsActive) _completionState = _completionState.Deactivate();
     }
 
     private static void InsertSelectedFile(string selectedFile)
@@ -445,26 +523,33 @@ internal static class InteractiveMode
             var reserved = inputHeight + separators + statusLineHeight;
             var contentHeight = Math.Max(0, height - reserved);
 
-            // Split content area: messages (top) and debug (bottom)
-            var debugHeight = Math.Min(Math.Max(contentHeight / 4, 3), contentHeight / 2); // between 3 lines and half
-            var messagesHeight = Math.Max(0, contentHeight - debugHeight - 1); // leave 1 line for divider
+            var debugHeight = Math.Min(Math.Max(contentHeight / 4, 3), contentHeight / 2);
+            var messagesHeight = Math.Max(0, contentHeight - debugHeight - 1);
 
-            var visibleMessages = _messages.TakeLast(messagesHeight).ToList();
-            for (var i = 0; i < messagesHeight; i++)
+            var styledVisible = _styledMessages.TakeLast(messagesHeight).ToList();
+            for (var row = 0; row < messagesHeight; row++)
             {
-                var line = i < visibleMessages.Count ? visibleMessages[i] : string.Empty;
-                if (line.Length > width) line = line[..width];
-                frame.WriteString(0, i, line.PadRight(width), Style.Empty);
+                if (row >= styledVisible.Count)
+                {
+                    frame.WriteString(0, row, string.Empty.PadRight(width), Style.Empty);
+                    continue;
+                }
+                var styledLine = styledVisible[row];
+                int col = 0;
+                foreach (var (text, style) in styledLine.Segments)
+                {
+                    if (col >= width) break;
+                    var remaining = width - col;
+                    var segmentText = text.Length > remaining ? text[..remaining] : text;
+                    frame.WriteString(col, row, segmentText, style);
+                    col += segmentText.Length;
+                }
+                if (col < width) frame.WriteString(col, row, new string(' ', width - col), Style.Empty);
             }
 
-            // Divider between messages and debug
             var debugDividerY = messagesHeight;
-            if (debugHeight > 0)
-            {
-                frame.WriteString(0, debugDividerY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
-            }
+            if (debugHeight > 0) frame.WriteString(0, debugDividerY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
 
-            // Debug lines
             var visibleDebug = _debugLines.TakeLast(debugHeight).ToList();
             for (var i = 0; i < debugHeight; i++)
             {
@@ -477,9 +562,7 @@ internal static class InteractiveMode
             frame.WriteString(0, sepAboveInputY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
 
             var inputRect = new Rect(0, sepAboveInputY + 1, width, inputHeight);
-            new MultiLineInputWidget()
-                .WithStyles(Style.Empty, Style.Empty.Add(TextModifier.Invert))
-                .Render(frame, inputRect, _inputState);
+            new MultiLineInputWidget().WithStyles(Style.Empty, Style.Empty.Add(TextModifier.Invert)).Render(frame, inputRect, _inputState);
 
             var sepBelowInputY = sepAboveInputY + 1 + inputHeight;
             frame.WriteString(0, sepBelowInputY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
@@ -488,11 +571,7 @@ internal static class InteractiveMode
             {
                 var popupWidget = CompletionPopupWidget.Create()
                     .WithMaxVisibleItems(10)
-                    .WithStyles(
-                        border: Style.Empty.WithForeground(Color.Cyan),
-                        title: Style.Empty.WithForeground(Color.Cyan).Add(TextModifier.Bold),
-                        selected: Style.Empty.Add(TextModifier.Invert),
-                        item: Style.Empty);
+                    .WithStyles(border: Style.Empty.WithForeground(Color.Cyan), title: Style.Empty.WithForeground(Color.Cyan).Add(TextModifier.Bold), selected: Style.Empty.Add(TextModifier.Invert), item: Style.Empty);
                 var popupRect = popupWidget.CalculatePopupRect(inputRect, _completionState, height);
                 popupWidget.Render(frame, popupRect, _completionState);
             }
@@ -504,3 +583,4 @@ internal static class InteractiveMode
         });
     }
 }
+
