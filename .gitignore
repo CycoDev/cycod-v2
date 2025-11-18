@@ -19,6 +19,8 @@ src/CycoTui.Backend.Windows/**/obj/
 src/CycoTui.Backend.Windows/**/bin/
 src/cycocli/obj/
 src/cycocli/bin/
+src/GlowSharp/**/bin/
+src/GlowSharp/**/obj/
 
 tests/**/bin/
 tests/**/obj/
