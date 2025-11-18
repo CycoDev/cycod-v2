@@ -7,9 +7,11 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.CommandLine" Version="2.0.0-beta4.22272.1" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.61.3" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../CycoTui.Core/CycoTui.Core.csproj" />
+    <ProjectReference Include="../common/common.csproj" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../CycoTui.Backend.Unix/CycoTui.Backend.Unix.csproj" />
