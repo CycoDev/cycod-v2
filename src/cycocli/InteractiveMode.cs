@@ -13,6 +13,7 @@ namespace CycoTui.Sample;
 
 internal static class InteractiveMode
 {
+    private static bool _shouldExit = false;
     private static ITerminalBackend? _backend;
     private static Terminal? _terminal;
 
@@ -38,6 +39,20 @@ internal static class InteractiveMode
             "Files"
         ),
 
+        // '/' for slash command completion
+        new CompletionTrigger(
+            '/',
+            async () =>
+            {
+                await Task.CompletedTask;
+                return new List<string>
+                {
+                    "exit", "save", "clear", "cost", "help"
+                };
+            },
+            "Commands"
+        ),
+
         // '#' for tag completion (example)
         new CompletionTrigger(
             '#',
@@ -57,7 +72,18 @@ internal static class InteractiveMode
     public static void Run(CancellationToken cancellationToken)
     {
         // Handle input submissions
-        _inputState.OnSubmit += text => _messages.Add(text);
+        _inputState.OnSubmit += text =>
+        {
+            var trimmed = text.Trim();
+            if (trimmed == "/exit")
+            {
+                _shouldExit = true;
+            }
+            else
+            {
+                _messages.Add(text);
+            }
+        };
 
         _backend = CreateBackend();
         _backend.Clear();
@@ -83,7 +109,7 @@ internal static class InteractiveMode
 
     private static void InputLoop(CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested && !_shouldExit)
         {
             var key = Console.ReadKey(intercept: true);
 
