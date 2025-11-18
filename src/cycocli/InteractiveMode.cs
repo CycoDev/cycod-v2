@@ -21,6 +21,7 @@ internal static class InteractiveMode
     private static Terminal? _terminal;
 
     private static readonly List<string> _messages = new();
+    private static readonly List<string> _debugLines = new();
     private static readonly MultiLineInputState _inputState = new();
     private static CompletionState _completionState = CompletionState.CreateInactive();
 
@@ -100,7 +101,8 @@ internal static class InteractiveMode
             _cycodStdin = _cycodProcess.StandardInput;
             Task.Run(() => ReadOutputLoop(_cycodProcess!.StandardOutput));
             Task.Run(() => ReadOutputLoop(_cycodProcess!.StandardError));
-            AddMessage($"Started cycod interactive: {psi.FileName} {psi.Arguments}");
+            AddMessage($"Started cycod interactive session");
+            AddDebug($"cycod start: {psi.FileName} {psi.Arguments}");
         }
         catch (Exception ex)
         {
@@ -134,10 +136,12 @@ internal static class InteractiveMode
                 test.WaitForExit(1500);
                 if (test.ExitCode == 0)
                 {
+                    AddDebug($"cycod candidate ok: {c}");
                     return c.StartsWith("dotnet ") ? ("dotnet", c.Substring(7)) : (c, string.Empty);
                 }
+                AddDebug($"cycod candidate not executable: {c} (exit {test.ExitCode})");
             }
-            catch { }
+            catch { AddDebug($"cycod candidate failed: {c}"); }
         }
         return null;
     }
@@ -147,6 +151,7 @@ internal static class InteractiveMode
         try
         {
             if (_cycodStdin == null) return;
+            AddDebug($"send: {text}");
             _cycodStdin.WriteLine(text);
             _cycodStdin.Flush();
         }
@@ -165,6 +170,7 @@ internal static class InteractiveMode
             {
                 if (string.IsNullOrEmpty(line)) continue;
                 AddMessage(line);
+                AddDebug($"recv: {line}");
             }
         }
         catch (Exception ex)
@@ -172,6 +178,16 @@ internal static class InteractiveMode
             AddMessage($"Output read error: {ex.Message}");
         }
     }
+    private static void AddDebug(string debug)
+    {
+        lock (_renderLock)
+        {
+            _debugLines.Add(debug);
+            if (_debugLines.Count > 200) _debugLines.RemoveAt(0);
+            Render();
+        }
+    }
+
 
     private static void AddMessage(string message)
     {
@@ -195,7 +211,7 @@ internal static class InteractiveMode
             }
             else
             {
-                AddMessage($">> {text}");
+                AddMessage($"user: {text}");
                 TrySendToCycod(text);
             }
         };
@@ -363,12 +379,32 @@ internal static class InteractiveMode
             var reserved = inputHeight + separators + statusLineHeight;
             var contentHeight = Math.Max(0, height - reserved);
 
-            var visibleMessages = _messages.TakeLast(contentHeight).ToList();
-            for (var i = 0; i < contentHeight; i++)
+            // Split content area: messages (top) and debug (bottom)
+            var debugHeight = Math.Min(Math.Max(contentHeight / 4, 3), contentHeight / 2); // between 3 lines and half
+            var messagesHeight = Math.Max(0, contentHeight - debugHeight - 1); // leave 1 line for divider
+
+            var visibleMessages = _messages.TakeLast(messagesHeight).ToList();
+            for (var i = 0; i < messagesHeight; i++)
             {
                 var line = i < visibleMessages.Count ? visibleMessages[i] : string.Empty;
                 if (line.Length > width) line = line[..width];
                 frame.WriteString(0, i, line.PadRight(width), Style.Empty);
+            }
+
+            // Divider between messages and debug
+            var debugDividerY = messagesHeight;
+            if (debugHeight > 0)
+            {
+                frame.WriteString(0, debugDividerY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
+            }
+
+            // Debug lines
+            var visibleDebug = _debugLines.TakeLast(debugHeight).ToList();
+            for (var i = 0; i < debugHeight; i++)
+            {
+                var line = i < visibleDebug.Count ? visibleDebug[i] : string.Empty;
+                if (line.Length > width) line = line[..width];
+                frame.WriteString(0, messagesHeight + 1 + i, line.PadRight(width), Style.Empty.Add(TextModifier.Dim));
             }
 
             var sepAboveInputY = contentHeight;
