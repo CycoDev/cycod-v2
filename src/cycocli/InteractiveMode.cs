@@ -19,6 +19,8 @@ internal static class InteractiveMode
     private static bool _shouldExit;
     private static ITerminalBackend? _backend;
     private static Terminal? _terminal;
+    private static Color? _terminalForeground;
+    private static Color? _terminalBackground;
 
     private static readonly List<string> _messages = new();
     // Debug area removed; retaining stub methods only
@@ -478,6 +480,10 @@ internal static class InteractiveMode
         };
 
         _backend = CreateBackend();
+
+        // Query terminal colors before clearing screen
+        (_terminalForeground, _terminalBackground) = _backend.QueryDefaultColors();
+
         _backend.Clear();
         _backend.SetCursorPosition(new Position(0, 0));
         _backend.HideCursor();
@@ -500,6 +506,41 @@ internal static class InteractiveMode
     private static ITerminalBackend CreateBackend() => OperatingSystem.IsWindows()
         ? new CycoTui.Backend.Windows.WindowsTerminalBackend()
         : new CycoTui.Backend.Unix.UnixTerminalBackend();
+
+    private static Color GetContrastingColor(Color? backgroundColor)
+    {
+        // If we don't have a background color, use a safe default (bright green for typical dark terminals)
+        if (backgroundColor == null)
+            return Color.Rgb(100, 255, 100);
+
+        var bg = backgroundColor.Value;
+
+        // Calculate relative luminance using sRGB formula
+        // L = 0.2126 * R + 0.7152 * G + 0.0722 * B
+        double r = bg.R / 255.0;
+        double g = bg.G / 255.0;
+        double b = bg.B / 255.0;
+
+        // Apply gamma correction
+        r = r <= 0.03928 ? r / 12.92 : Math.Pow((r + 0.055) / 1.055, 2.4);
+        g = g <= 0.03928 ? g / 12.92 : Math.Pow((g + 0.055) / 1.055, 2.4);
+        b = b <= 0.03928 ? b / 12.92 : Math.Pow((b + 0.055) / 1.055, 2.4);
+
+        double luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+        // If background is dark (luminance < 0.5), return light color
+        // If background is light (luminance >= 0.5), return dark color
+        if (luminance < 0.5)
+        {
+            // Dark background - use bright green
+            return Color.Rgb(100, 255, 100);
+        }
+        else
+        {
+            // Light background - use forest green
+            return Color.Rgb(34, 139, 34);
+        }
+    }
 
     private static void InputLoop(CancellationToken cancellationToken)
     {
@@ -681,12 +722,18 @@ internal static class InteractiveMode
 
             // Status line (one row above the bottom)
             var statusY = lowerSepY + 1;
-            var wordNav = OperatingSystem.IsWindows() ? "Alt+←→" : "Cmd+←→";
-            var termType = Environment.GetEnvironmentVariable("TERM") ?? "unknown";
-            var warpMarker = isWarp ? " WARP" : "";
-            var status = $"Messages: {_messages.Count}  Line: {_inputState.CursorLineIndex + 1}/{_inputState.Lines.Count}  Col: {_inputState.CursorColumn}  {width}x{height}{warpMarker} {termType}  ←→↑↓=Move  {wordNav}=Word  Home/End  Enter=Submit  Ctrl+J=NewLine  Esc=Quit";
-            if (status.Length > width) status = status[..width];
-            frame.WriteString(0, statusY, status.PadRight(width), Style.Empty.Add(TextModifier.Bold));
+            var currentDir = Environment.CurrentDirectory;
+            var statusColor = GetContrastingColor(_terminalBackground);
+            var statusStyle = Style.Empty.WithForeground(statusColor);
+
+            // Truncate path if too long
+            var displayPath = currentDir;
+            if (displayPath.Length > width)
+            {
+                displayPath = "..." + displayPath.Substring(displayPath.Length - (width - 3));
+            }
+
+            frame.WriteString(0, statusY, displayPath.PadRight(width), statusStyle);
 
             // Empty line at the very bottom
             var bottomPaddingY = statusY + 1;

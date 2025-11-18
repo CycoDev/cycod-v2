@@ -54,6 +54,18 @@ public interface ITerminalBackend : IDisposable
 
     /// <summary>Backend capability snapshot populated at initialization.</summary>
     BackendCapabilities Capabilities { get; }
+
+    /// <summary>
+    /// Query the terminal's default foreground and background colors using OSC 10/11.
+    /// Returns null for each color if detection is unsupported or fails.
+    ///
+    /// NOTE: This feature requires the terminal to support OSC 10/11 queries and
+    /// may not work reliably in all scenarios due to .NET Console API limitations.
+    /// The terminal must be in a state where escape sequence responses can be read
+    /// from stdin. Works best when called before entering interactive input loops
+    /// or when the terminal is in raw mode.
+    /// </summary>
+    (Style.Color? Foreground, Style.Color? Background) QueryDefaultColors();
 }
 
 // NOTE: Remaining related types moved to separate files as part of refactor.

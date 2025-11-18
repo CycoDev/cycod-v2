@@ -30,4 +30,5 @@ internal sealed class MinimalBackendStub : ITerminalBackend
     public void ScrollRegionUp(Range region, int lineCount) { }
     public void SetCursorPosition(Position position) { }
     public void ShowCursor() { }
+    public (Style.Color? Foreground, Style.Color? Background) QueryDefaultColors() => (null, null);
 }
