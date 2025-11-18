@@ -477,12 +477,14 @@ internal static class InteractiveMode
             }
         };
 
-        StartCycodInteractive();
-
         _backend = CreateBackend();
         _backend.Clear();
+        _backend.SetCursorPosition(new Position(0, 0));
         _backend.HideCursor();
         _terminal = new Terminal(_backend, new LoggingContext(null));
+
+        StartCycodInteractive();
+
         try
         {
             Render();
@@ -618,19 +620,36 @@ internal static class InteractiveMode
         {
             var width = size.Width;
             var height = size.Height;
-            var statusLineHeight = 1;
-            var inputHeight = Math.Max(1, _inputState.Lines.Count);
-            var separators = 2;
-            var reserved = inputHeight + separators + statusLineHeight;
-            var contentHeight = Math.Max(0, height - reserved);
 
-            var messagesHeight = contentHeight;
+            // Warp terminal detection - check for common Warp environment variables
+            var isWarp = Environment.GetEnvironmentVariable("TERM_PROGRAM")?.Contains("WarpTerminal") == true
+                      || Environment.GetEnvironmentVariable("WARP_SESSION_ID") != null
+                      || Environment.GetEnvironmentVariable("WARP_IS_LOCAL_SHELL_SESSION") != null;
+
+            // Warp seems to report extra rows that aren't actually visible
+            // Subtract 2 to ensure proper spacing at bottom
+            if (isWarp && height > 2) height -= 2;
+
+            // Layout calculation (from bottom up, like Claude Code)
+            var bottomPaddingHeight = 1; // Empty line at very bottom
+            var statusLineHeight = 1;
+            var lowerSeparatorHeight = 1;
+            var inputHeight = Math.Max(1, _inputState.Lines.Count);
+            var upperSeparatorHeight = 1;
+            var reserved = bottomPaddingHeight + statusLineHeight + lowerSeparatorHeight + inputHeight + upperSeparatorHeight;
+            var messagesHeight = Math.Max(0, height - reserved);
+
+            // Messages area (top, rows 0 to messagesHeight-1)
+            var messagesStartY = 0;
             var styledVisible = _styledMessages.TakeLast(messagesHeight).ToList();
             int messageCount = styledVisible.Count;
             int startRow = Math.Max(0, messagesHeight - messageCount);
-            // Clear area
-            for (var r = 0; r < messagesHeight; r++) frame.WriteString(0, r, new string(' ', width), Style.Empty);
-            // Render bottom-aligned
+
+            // Clear messages area
+            for (var r = 0; r < messagesHeight; r++)
+                frame.WriteString(0, messagesStartY + r, new string(' ', width), Style.Empty);
+
+            // Render messages bottom-aligned within their area
             for (var row = 0; row < messageCount; row++)
             {
                 var styledLine = styledVisible[row];
@@ -640,21 +659,47 @@ internal static class InteractiveMode
                     if (col >= width) break;
                     var remaining = width - col;
                     var segmentText = text.Length > remaining ? text[..remaining] : text;
-                    frame.WriteString(col, startRow + row, segmentText, style);
+                    frame.WriteString(col, messagesStartY + startRow + row, segmentText, style);
                     col += segmentText.Length;
                 }
-                if (col < width) frame.WriteString(col, startRow + row, new string(' ', width - col), Style.Empty);
+                if (col < width)
+                    frame.WriteString(col, messagesStartY + startRow + row, new string(' ', width - col), Style.Empty);
             }
 
-            var sepAboveInputY = contentHeight;
-            frame.WriteString(0, sepAboveInputY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
+            // Upper separator (above input)
+            var upperSepY = messagesHeight;
+            frame.WriteString(0, upperSepY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
 
-            var inputRect = new Rect(0, sepAboveInputY + 1, width, inputHeight);
+            // Input area
+            var inputY = upperSepY + 1;
+            var inputRect = new Rect(0, inputY, width, inputHeight);
             new MultiLineInputWidget().WithStyles(Style.Empty, Style.Empty.Add(TextModifier.Invert)).Render(frame, inputRect, _inputState);
 
-            var sepBelowInputY = sepAboveInputY + 1 + inputHeight;
-            frame.WriteString(0, sepBelowInputY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
+            // Lower separator (below input, above status)
+            var lowerSepY = inputY + inputHeight;
+            frame.WriteString(0, lowerSepY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
 
+            // Status line (one row above the bottom)
+            var statusY = lowerSepY + 1;
+            var wordNav = OperatingSystem.IsWindows() ? "Alt+←→" : "Cmd+←→";
+            var termType = Environment.GetEnvironmentVariable("TERM") ?? "unknown";
+            var warpMarker = isWarp ? " WARP" : "";
+            var status = $"Messages: {_messages.Count}  Line: {_inputState.CursorLineIndex + 1}/{_inputState.Lines.Count}  Col: {_inputState.CursorColumn}  {width}x{height}{warpMarker} {termType}  ←→↑↓=Move  {wordNav}=Word  Home/End  Enter=Submit  Ctrl+J=NewLine  Esc=Quit";
+            if (status.Length > width) status = status[..width];
+            frame.WriteString(0, statusY, status.PadRight(width), Style.Empty.Add(TextModifier.Bold));
+
+            // Empty line at the very bottom
+            var bottomPaddingY = statusY + 1;
+            frame.WriteString(0, bottomPaddingY, new string(' ', width), Style.Empty);
+
+            // Warp-specific: Write an additional empty line using backend directly
+            if (isWarp && bottomPaddingY + 1 < size.Height)
+            {
+                _backend?.WriteRaw($"\u001b[{bottomPaddingY + 2};1H"); // Move to row below padding
+                _backend?.WriteRaw(new string(' ', width)); // Write spaces
+            }
+
+            // Completion popup
             if (_completionState.IsActive)
             {
                 var popupWidget = CompletionPopupWidget.Create()
@@ -663,11 +708,6 @@ internal static class InteractiveMode
                 var popupRect = popupWidget.CalculatePopupRect(inputRect, _completionState, height);
                 popupWidget.Render(frame, popupRect, _completionState);
             }
-
-            var wordNav = OperatingSystem.IsWindows() ? "Alt+←→" : "Cmd+←→";
-            var status = $"Messages: {_messages.Count}  Line: {_inputState.CursorLineIndex + 1}/{_inputState.Lines.Count}  Col: {_inputState.CursorColumn}  ←→↑↓=Move  {wordNav}=Word  Home/End  Enter=Submit  Ctrl+J=NewLine  Esc=Quit";
-            if (status.Length > width) status = status[..width];
-            frame.WriteString(0, sepBelowInputY + 1, status.PadRight(width), Style.Empty.Add(TextModifier.Bold));
         });
     }
 }

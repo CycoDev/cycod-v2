@@ -67,8 +67,8 @@ public sealed class WindowsTerminalBackend : ITerminalBackend
     {
         for (int i = 0; i < count; i++) Console.WriteLine();
     }
-    public Size GetSize() => new(Console.BufferWidth, Console.BufferHeight);
-    public WindowSize GetWindowSize() => new(new Size(Console.BufferWidth, Console.BufferHeight), Size.Empty);
+    public Size GetSize() => new(Console.WindowWidth, Console.WindowHeight);
+    public WindowSize GetWindowSize() => new(new Size(Console.WindowWidth, Console.WindowHeight), Size.Empty);
     public void ScrollRegionUp(Range region, int lineCount) { /* no-op phase-1 */ }
     public void ScrollRegionDown(Range region, int lineCount) { /* no-op phase-1 */ }
 

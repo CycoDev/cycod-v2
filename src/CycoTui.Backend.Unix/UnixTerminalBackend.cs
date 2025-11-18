@@ -56,9 +56,9 @@ public sealed class UnixTerminalBackend : ITerminalBackend
     {
         try
         {
-            // Attempt environment-based size detection; fallback 80x24.
-            int w = Console.BufferWidth;
-            int h = Console.BufferHeight;
+            // Use window size, not buffer size (buffer can be huge on Unix/macOS)
+            int w = Console.WindowWidth;
+            int h = Console.WindowHeight;
             return new Size(w, h);
         }
         catch { return new Size(80,24); }
