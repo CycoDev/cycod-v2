@@ -19,6 +19,8 @@ internal static class InteractiveMode
     private static bool _shouldExit;
     private static ITerminalBackend? _backend;
     private static Terminal? _terminal;
+    private static string? _cachedGitBranch;
+    private static string? _cachedCurrentLLM;
 
     private static readonly List<string> _messages = new();
     // Debug area removed; retaining stub methods only
@@ -460,8 +462,12 @@ internal static class InteractiveMode
         }
     }
 
-    public static void Run(CancellationToken cancellationToken)
+    public static void Run(CancellationToken cancellationToken, string? gitBranch = null, string? currentLLM = null)
     {
+        // Cache the passed-in values
+        _cachedGitBranch = gitBranch;
+        _cachedCurrentLLM = currentLLM;
+
         _inputState.OnSubmit += text =>
         {
             var trimmed = text.Trim();
@@ -500,6 +506,112 @@ internal static class InteractiveMode
     private static ITerminalBackend CreateBackend() => OperatingSystem.IsWindows()
         ? new CycoTui.Backend.Windows.WindowsTerminalBackend()
         : new CycoTui.Backend.Unix.UnixTerminalBackend();
+
+    public static string? GetGitBranch()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "git",
+                Arguments = "branch --show-current",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Environment.CurrentDirectory
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null) return null;
+
+            process.WaitForExit(500);
+            if (process.ExitCode != 0) return null;
+
+            var branch = process.StandardOutput.ReadToEnd().Trim();
+            return string.IsNullOrEmpty(branch) ? null : branch;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static string? GetCurrentLLM()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cycod",
+                Arguments = "config list",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Environment.CurrentDirectory
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null) return null;
+
+            process.WaitForExit(1000);
+            if (process.ExitCode != 0) return null;
+
+            var output = process.StandardOutput.ReadToEnd();
+
+            // Parse the output to find App.PreferredProvider and model name
+            var provider = ParseConfigValue(output, "App.PreferredProvider");
+            if (string.IsNullOrEmpty(provider)) return null;
+
+            // Based on provider, get the corresponding model name
+            var modelKey = GetModelKeyForProvider(provider);
+            if (modelKey == null) return null;
+
+            var modelName = ParseConfigValue(output, modelKey);
+            if (string.IsNullOrEmpty(modelName)) return null;
+
+            return $"{provider}:{modelName}";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? ParseConfigValue(string configOutput, string key)
+    {
+        var lines = configOutput.Split('\n');
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith($"{key}:", StringComparison.OrdinalIgnoreCase))
+            {
+                var colonIndex = trimmed.IndexOf(':');
+                if (colonIndex >= 0 && colonIndex + 1 < trimmed.Length)
+                {
+                    return trimmed.Substring(colonIndex + 1).Trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static string? GetModelKeyForProvider(string provider)
+    {
+        var lowerProvider = provider.ToLowerInvariant();
+        return lowerProvider switch
+        {
+            "copilot" or "copilot-github" => "Copilot.ModelName",
+            "anthropic" => "Anthropic.ModelName",
+            "openai" => "OpenAI.ChatModelName",
+            "google" or "gemini" or "google-gemini" => "Google.Gemini.ModelId",
+            "grok" or "x.ai" => "Grok.ModelName",
+            "aws" or "bedrock" or "aws-bedrock" => "AWS.Bedrock.ModelId",
+            "azure" or "azure-openai" => "Azure.OpenAI.ChatDeployment",
+            _ => null
+        };
+    }
 
     private static void InputLoop(CancellationToken cancellationToken)
     {
@@ -681,12 +793,69 @@ internal static class InteractiveMode
 
             // Status line (one row above the bottom)
             var statusY = lowerSepY + 1;
-            var wordNav = OperatingSystem.IsWindows() ? "Alt+←→" : "Cmd+←→";
-            var termType = Environment.GetEnvironmentVariable("TERM") ?? "unknown";
-            var warpMarker = isWarp ? " WARP" : "";
-            var status = $"Messages: {_messages.Count}  Line: {_inputState.CursorLineIndex + 1}/{_inputState.Lines.Count}  Col: {_inputState.CursorColumn}  {width}x{height}{warpMarker} {termType}  ←→↑↓=Move  {wordNav}=Word  Home/End  Enter=Submit  Ctrl+J=NewLine  Esc=Quit";
-            if (status.Length > width) status = status[..width];
-            frame.WriteString(0, statusY, status.PadRight(width), Style.Empty.Add(TextModifier.Bold));
+            var currentDir = Environment.CurrentDirectory;
+            var gitBranch = _cachedGitBranch;
+            var currentLLM = _cachedCurrentLLM;
+
+            // Static colors: model=lightblue, branch=salmon, path=lightgreen
+            var llmColor = Color.Rgb(173, 216, 230);    // Light blue
+            var branchColor = Color.Rgb(250, 128, 114); // Salmon
+            var pathColor = Color.Rgb(144, 238, 144);   // Light green
+
+            // Build status parts in order: llm - branch - path
+            var parts = new List<(string text, Color color)>();
+            if (currentLLM != null) parts.Add((currentLLM, llmColor));
+            if (gitBranch != null) parts.Add((gitBranch, branchColor));
+            parts.Add((currentDir, pathColor));
+
+            // Calculate total length with separators
+            var separator = " - ";
+            var totalLength = parts.Sum(p => p.text.Length) + (separator.Length * (parts.Count - 1));
+
+            // Truncate path if needed
+            if (totalLength > width && parts.Count > 0)
+            {
+                var pathIndex = parts.Count - 1;
+                var pathPart = parts[pathIndex].text;
+                var otherPartsLength = parts.Take(pathIndex).Sum(p => p.text.Length) + (separator.Length * (parts.Count - 1));
+                var availableForPath = width - otherPartsLength;
+
+                if (availableForPath > 10)
+                {
+                    var truncatedPath = "..." + pathPart.Substring(pathPart.Length - (availableForPath - 3));
+                    parts[pathIndex] = (truncatedPath, pathColor);
+                }
+                else if (availableForPath > 3)
+                {
+                    parts[pathIndex] = ("...", pathColor);
+                }
+            }
+
+            // Render each part with its color
+            int statusCol = 0;
+            for (int i = 0; i < parts.Count; i++)
+            {
+                if (statusCol >= width) break;
+
+                var (text, color) = parts[i];
+                var style = Style.Empty.WithForeground(color);
+                var displayText = text.Length > width - statusCol ? text.Substring(0, width - statusCol) : text;
+                frame.WriteString(statusCol, statusY, displayText, style);
+                statusCol += displayText.Length;
+
+                // Add separator if not last part
+                if (i < parts.Count - 1 && statusCol + separator.Length <= width)
+                {
+                    frame.WriteString(statusCol, statusY, separator, style);
+                    statusCol += separator.Length;
+                }
+            }
+
+            // Fill remaining space
+            if (statusCol < width)
+            {
+                frame.WriteString(statusCol, statusY, new string(' ', width - statusCol), Style.Empty);
+            }
 
             // Empty line at the very bottom
             var bottomPaddingY = statusY + 1;

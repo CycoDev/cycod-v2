@@ -24,7 +24,9 @@ internal static class Program
         var chatCommand = new System.CommandLine.Command("chat", "Start interactive chat mode");
         chatCommand.SetHandler(() =>
         {
-            InteractiveMode.Run(_cts.Token);
+            var gitBranch = InteractiveMode.GetGitBranch();
+            var currentLLM = InteractiveMode.GetCurrentLLM();
+            InteractiveMode.Run(_cts.Token, gitBranch, currentLLM);
         });
         rootCommand.AddCommand(chatCommand);
 
@@ -105,7 +107,9 @@ internal static class Program
         // Smart detection: if no arguments, start interactive mode
         if (args.Length == 0)
         {
-            InteractiveMode.Run(_cts.Token);
+            var gitBranch = InteractiveMode.GetGitBranch();
+            var currentLLM = InteractiveMode.GetCurrentLLM();
+            InteractiveMode.Run(_cts.Token, gitBranch, currentLLM);
             return 0;
         }
 
