@@ -21,7 +21,7 @@ internal static class InteractiveMode
     private static Terminal? _terminal;
 
     private static readonly List<string> _messages = new();
-    private static readonly List<string> _debugLines = new();
+    // Debug area removed; retaining stub methods only
     private static readonly MultiLineInputState _inputState = new();
     private static CompletionState _completionState = CompletionState.CreateInactive();
 
@@ -271,30 +271,92 @@ internal static class InteractiveMode
         }
     }
 
-    private static void AddDebug(string debug)
-    {
-        lock (_renderLock)
-        {
-            _debugLines.Add(debug);
-            if (_debugLines.Count > 200) _debugLines.RemoveAt(0);
-            Render();
-        }
-    }
+    private static void AddDebug(string debug) { /* debug output suppressed */ }
+
+    private static readonly System.Text.StringBuilder _stdoutLine = new();
+    private static readonly System.Text.StringBuilder _stderrLine = new();
 
     private static void ReadStreamChunked(StreamReader reader, bool isError)
     {
+        bool assistantActive = false;
+        var assistantBuffer = new System.Text.StringBuilder();
+        var scratch = new char[256];
         try
         {
-            var buffer = new char[256];
-            var sb = new System.Text.StringBuilder();
             while (true)
             {
-                int read = reader.Read(buffer, 0, buffer.Length);
+                int read = reader.Read(scratch, 0, scratch.Length);
                 if (read <= 0) break;
-                sb.Append(buffer, 0, read);
-                ProcessBufferedText(sb, isError);
+                int i = 0;
+                while (i < read)
+                {
+                    char c = scratch[i];
+                    if (c == '\u001b')
+                    {
+                        // Skip escape/control sequences
+                        if (i + 1 < read && scratch[i + 1] == '[')
+                        {
+                            int j = i + 2;
+                            while (j < read && !IsCsiFinalByte(scratch[j])) j++;
+                            i = (j < read) ? j + 1 : read;
+                            continue;
+                        }
+                        else if (i + 1 < read && scratch[i + 1] == ']')
+                        {
+                            int j = i + 2;
+                            while (j < read && scratch[j] != '\u0007')
+                            {
+                                if (scratch[j] == '\u001b' && j + 1 < read && scratch[j + 1] == '\\') { j += 2; break; }
+                                j++;
+                            }
+                            i = Math.Min(read, j + 1);
+                            continue;
+                        }
+                        else
+                        {
+                            i += (i + 1 < read) ? 2 : 1;
+                            continue;
+                        }
+                    }
+                    else if (c == '\r') { i++; continue; }
+                    else if (c == '\n')
+                    {
+                        if (assistantActive)
+                        {
+                            ReplaceOrAppendAssistant("Assistant: " + assistantBuffer.ToString());
+                            assistantBuffer.Clear();
+                            assistantActive = false;
+                        }
+                        i++;
+                        continue;
+                    }
+                    else
+                    {
+                        if (!assistantActive)
+                        {
+                            if (TryMatchLiteral(scratch, i, read, "Assistant: ", out var advA))
+                            {
+                                assistantActive = true;
+                                i += advA;
+                                continue;
+                            }
+                            if (TryMatchLiteral(scratch, i, read, "User: ", out var advU))
+                            {
+                                // Suppress raw cycod user prompt; we already show the user's input ourselves.
+                                i += advU;
+                                while (i < read && scratch[i] != '\n' && scratch[i] != '\r') { i++; }
+                                continue;
+                            }
+                        }
+                        if (assistantActive) assistantBuffer.Append(c);
+                        i++;
+                    }
+                }
             }
-            if (sb.Length > 0) ProcessBufferedText(sb, isError, flushAll: true);
+            if (assistantActive && assistantBuffer.Length > 0)
+            {
+                ReplaceOrAppendAssistant("Assistant: " + assistantBuffer.ToString());
+            }
         }
         catch (Exception ex)
         {
@@ -302,8 +364,19 @@ internal static class InteractiveMode
         }
     }
 
+    private static bool TryMatchLiteral(char[] buffer, int index, int length, string literal, out int advance)
+    {
+        advance = 0;
+        if (index + literal.Length > length) return false;
+        for (int i = 0; i < literal.Length; i++) if (buffer[index + i] != literal[i]) return false;
+        advance = literal.Length;
+        return true;
+    }
+
+    /* Legacy buffered line processing removed for overwrite-aware streaming */
     private static void ProcessBufferedText(System.Text.StringBuilder sb, bool isError, bool flushAll = false)
     {
+        // Deprecated path: should no longer be invoked; keep for fallback.
         var text = sb.ToString();
         int lastNewline = text.LastIndexOf('\n');
         if (lastNewline == -1 && !flushAll) return;
@@ -320,6 +393,8 @@ internal static class InteractiveMode
             {
                 if (isPrompt)
                 {
+                    int cr = line.LastIndexOf('\r');
+                    if (cr >= 0) line = line[(cr + 1)..];
                     AddParsedStyledMessage(line);
                     AddDebug($"prompt(recv): {line}");
                 }
@@ -330,6 +405,9 @@ internal static class InteractiveMode
             }
             else
             {
+                // Option A: handle carriage return overwrite semantics
+                int cr = line.LastIndexOf('\r');
+                if (cr >= 0) line = line[(cr + 1)..];
                 AddParsedStyledMessage(line);
                 AddDebug($"recv: {line}");
             }
@@ -346,6 +424,29 @@ internal static class InteractiveMode
             foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
             _styledMessages.Add(styled);
             _messages.Add(raw);
+            Render();
+        }
+    }
+
+    private static void ReplaceOrAppendAssistant(string raw)
+    {
+        lock (_renderLock)
+        {
+            if (_messages.Count > 0 && _messages[^1].StartsWith("Assistant:"))
+            {
+                // Replace last assistant message
+                _messages[^1] = raw;
+                var styled = _styledMessages[^1];
+                styled.Segments.Clear();
+                foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
+            }
+            else
+            {
+                var styled = new StyledLine();
+                foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
+                _styledMessages.Add(styled);
+                _messages.Add(raw);
+            }
             Render();
         }
     }
@@ -371,7 +472,7 @@ internal static class InteractiveMode
             }
             else
             {
-                AddMessage($"user: {text}");
+                AddParsedStyledMessage($"User: {text}");
                 TrySendToCycod(text);
             }
         };
@@ -523,17 +624,15 @@ internal static class InteractiveMode
             var reserved = inputHeight + separators + statusLineHeight;
             var contentHeight = Math.Max(0, height - reserved);
 
-            var debugHeight = Math.Min(Math.Max(contentHeight / 4, 3), contentHeight / 2);
-            var messagesHeight = Math.Max(0, contentHeight - debugHeight - 1);
-
+            var messagesHeight = contentHeight;
             var styledVisible = _styledMessages.TakeLast(messagesHeight).ToList();
-            for (var row = 0; row < messagesHeight; row++)
+            int messageCount = styledVisible.Count;
+            int startRow = Math.Max(0, messagesHeight - messageCount);
+            // Clear area
+            for (var r = 0; r < messagesHeight; r++) frame.WriteString(0, r, new string(' ', width), Style.Empty);
+            // Render bottom-aligned
+            for (var row = 0; row < messageCount; row++)
             {
-                if (row >= styledVisible.Count)
-                {
-                    frame.WriteString(0, row, string.Empty.PadRight(width), Style.Empty);
-                    continue;
-                }
                 var styledLine = styledVisible[row];
                 int col = 0;
                 foreach (var (text, style) in styledLine.Segments)
@@ -541,21 +640,10 @@ internal static class InteractiveMode
                     if (col >= width) break;
                     var remaining = width - col;
                     var segmentText = text.Length > remaining ? text[..remaining] : text;
-                    frame.WriteString(col, row, segmentText, style);
+                    frame.WriteString(col, startRow + row, segmentText, style);
                     col += segmentText.Length;
                 }
-                if (col < width) frame.WriteString(col, row, new string(' ', width - col), Style.Empty);
-            }
-
-            var debugDividerY = messagesHeight;
-            if (debugHeight > 0) frame.WriteString(0, debugDividerY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
-
-            var visibleDebug = _debugLines.TakeLast(debugHeight).ToList();
-            for (var i = 0; i < debugHeight; i++)
-            {
-                var line = i < visibleDebug.Count ? visibleDebug[i] : string.Empty;
-                if (line.Length > width) line = line[..width];
-                frame.WriteString(0, messagesHeight + 1 + i, line.PadRight(width), Style.Empty.Add(TextModifier.Dim));
+                if (col < width) frame.WriteString(col, startRow + row, new string(' ', width - col), Style.Empty);
             }
 
             var sepAboveInputY = contentHeight;
