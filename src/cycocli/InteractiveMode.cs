@@ -1,4 +1,7 @@
 using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -13,22 +16,16 @@ namespace CycoTui.Sample;
 
 internal static class InteractiveMode
 {
-    private static bool _shouldExit = false;
+    private static bool _shouldExit;
     private static ITerminalBackend? _backend;
     private static Terminal? _terminal;
 
-    // Content history (top area)
     private static readonly List<string> _messages = new();
-    // Multi-line input state (handles input, cursor, etc.)
     private static readonly MultiLineInputState _inputState = new();
-    // Completion state (handles '@', '#', etc. completion popup)
     private static CompletionState _completionState = CompletionState.CreateInactive();
 
-    // Configure multiple completion triggers
-    // Each trigger can have its own provider and label
     private static readonly List<CompletionTrigger> _completionTriggers = new()
     {
-        // '@' for file completion
         new CompletionTrigger(
             '@',
             async () =>
@@ -38,22 +35,15 @@ internal static class InteractiveMode
             },
             "Files"
         ),
-
-        // '/' for slash command completion
         new CompletionTrigger(
             '/',
             async () =>
             {
                 await Task.CompletedTask;
-                return new List<string>
-                {
-                    "exit"
-                };
+                return new List<string> { "exit" };
             },
             "Commands"
         ),
-
-        // '#' for tag completion (example)
         new CompletionTrigger(
             '#',
             async () =>
@@ -69,21 +59,148 @@ internal static class InteractiveMode
         )
     };
 
+    private static readonly object _renderLock = new();
+    private static Process? _cycodProcess;
+    private static StreamWriter? _cycodStdin;
+
+    // --- Cycod interactive helpers ---
+    private static void StartCycodInteractive()
+    {
+        if (_cycodProcess != null) return;
+        var cycodPath = ResolveCycodPath();
+        if (cycodPath == null)
+        {
+            AddMessage("cycod executable not found. Install with: dotnet tool install -g cycod");
+            return;
+        }
+        var (fileName, args) = cycodPath.Value;
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = (string.IsNullOrEmpty(args) ? string.Empty : args + " ") + "chat",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = Environment.CurrentDirectory
+            };
+            psi.Environment["FORCE_COLOR"] = "1";
+            psi.Environment["NO_COLOR"] = "0";
+            psi.Environment["TERM"] = "xterm-256color";
+
+            _cycodProcess = Process.Start(psi);
+            if (_cycodProcess == null)
+            {
+                AddMessage("Failed to start cycod process");
+                return;
+            }
+            _cycodStdin = _cycodProcess.StandardInput;
+            Task.Run(() => ReadOutputLoop(_cycodProcess!.StandardOutput));
+            Task.Run(() => ReadOutputLoop(_cycodProcess!.StandardError));
+            AddMessage($"Started cycod interactive: {psi.FileName} {psi.Arguments}");
+        }
+        catch (Exception ex)
+        {
+            AddMessage($"Error starting cycod: {ex.Message}");
+        }
+    }
+
+    private static (string fileName, string args)? ResolveCycodPath()
+    {
+        var candidates = new List<string>
+        {
+            "cycod",
+            "dotnet tool run cycod"
+        };
+        foreach (var c in candidates)
+        {
+            try
+            {
+                var fileName = c.StartsWith("dotnet ") ? "dotnet" : c;
+                var args = c.StartsWith("dotnet ") ? c.Substring(7) + " --version" : "--version";
+                using var test = Process.Start(new ProcessStartInfo
+                {
+                    FileName = fileName,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                });
+                if (test == null) continue;
+                test.WaitForExit(1500);
+                if (test.ExitCode == 0)
+                {
+                    return c.StartsWith("dotnet ") ? ("dotnet", c.Substring(7)) : (c, string.Empty);
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private static void TrySendToCycod(string text)
+    {
+        try
+        {
+            if (_cycodStdin == null) return;
+            _cycodStdin.WriteLine(text);
+            _cycodStdin.Flush();
+        }
+        catch (Exception ex)
+        {
+            AddMessage($"Failed to send to cycod: {ex.Message}");
+        }
+    }
+
+    private static void ReadOutputLoop(StreamReader reader)
+    {
+        try
+        {
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrEmpty(line)) continue;
+                AddMessage(line);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddMessage($"Output read error: {ex.Message}");
+        }
+    }
+
+    private static void AddMessage(string message)
+    {
+        lock (_renderLock)
+        {
+            _messages.Add(message);
+            Render();
+        }
+    }
+
+    // --- Entry point ---
     public static void Run(CancellationToken cancellationToken)
     {
-        // Handle input submissions
         _inputState.OnSubmit += text =>
         {
             var trimmed = text.Trim();
             if (trimmed == "/exit")
             {
                 _shouldExit = true;
+                TrySendToCycod("exit");
             }
             else
             {
-                _messages.Add(text);
+                AddMessage($">> {text}");
+                TrySendToCycod(text);
             }
         };
+
+        StartCycodInteractive();
 
         _backend = CreateBackend();
         _backend.Clear();
@@ -111,9 +228,15 @@ internal static class InteractiveMode
     {
         while (!cancellationToken.IsCancellationRequested && !_shouldExit)
         {
+            if (_cycodProcess != null && _cycodProcess.HasExited)
+            {
+                AddMessage($"cycod process exited (code {_cycodProcess.ExitCode})");
+                _shouldExit = true;
+                break;
+            }
+
             var key = Console.ReadKey(intercept: true);
 
-            // Handle ESC key - cancel completion or quit
             if (key.Key == ConsoleKey.Escape)
             {
                 if (_completionState.IsActive)
@@ -125,16 +248,14 @@ internal static class InteractiveMode
                 break;
             }
 
-            // Handle Ctrl+Q for quitting
             if (key.Key == ConsoleKey.Q && (key.Modifiers & ConsoleModifiers.Control) != 0)
             {
                 break;
             }
 
-            // If completion is active, intercept navigation keys
             if (_completionState.IsActive)
             {
-                bool handled = HandleCompletionKey(key);
+                var handled = HandleCompletionKey(key);
                 if (handled)
                 {
                     Render();
@@ -142,10 +263,8 @@ internal static class InteractiveMode
                 }
             }
 
-            // Let the input state handle the key
             if (_inputState.HandleKey(key))
             {
-                // After input changes, check if we should activate/update completion
                 UpdateCompletionState();
                 Render();
             }
@@ -154,23 +273,16 @@ internal static class InteractiveMode
 
     private static bool HandleCompletionKey(ConsoleKeyInfo key)
     {
-        // Up arrow or Ctrl+P - select previous item
-        if (key.Key == ConsoleKey.UpArrow ||
-            (key.Key == ConsoleKey.P && (key.Modifiers & ConsoleModifiers.Control) != 0))
+        if (key.Key == ConsoleKey.UpArrow || (key.Key == ConsoleKey.P && (key.Modifiers & ConsoleModifiers.Control) != 0))
         {
             _completionState = _completionState.SelectPrevious();
             return true;
         }
-
-        // Down arrow or Ctrl+N - select next item
-        if (key.Key == ConsoleKey.DownArrow ||
-            (key.Key == ConsoleKey.N && (key.Modifiers & ConsoleModifiers.Control) != 0))
+        if (key.Key == ConsoleKey.DownArrow || (key.Key == ConsoleKey.N && (key.Modifiers & ConsoleModifiers.Control) != 0))
         {
             _completionState = _completionState.SelectNext();
             return true;
         }
-
-        // Enter or Tab - insert selected file
         if (key.Key == ConsoleKey.Enter || key.Key == ConsoleKey.Tab)
         {
             var selectedItem = _completionState.GetSelectedItem();
@@ -181,68 +293,43 @@ internal static class InteractiveMode
                 return true;
             }
         }
-
         return false;
     }
 
     private static void UpdateCompletionState()
     {
-        // Get current line and cursor position
         if (_inputState.Lines.Count == 0) return;
-
         var currentLine = _inputState.Lines[_inputState.CursorLineIndex];
         var cursorColumn = _inputState.CursorColumn;
-
-        // Collect all trigger characters
         var triggerChars = _completionTriggers.Select(t => t.TriggerChar);
 
-        // Detect if there's an active completion trigger
         var query = CompletionHelper.DetectCompletionQuery(
             currentLine,
             cursorColumn,
             triggerChars,
-            out int triggerColumn,
-            out char foundTriggerChar);
+            out var triggerColumn,
+            out var foundTriggerChar);
 
         if (query != null)
         {
-            // Find the matching trigger configuration
             var trigger = _completionTriggers.FirstOrDefault(t => t.TriggerChar == foundTriggerChar);
             if (trigger.Provider == null)
             {
-                // No provider configured for this trigger
                 _completionState = _completionState.Deactivate();
                 return;
             }
-
-            // Activate or update completion
             if (!_completionState.IsActive || _completionState.TriggerChar != foundTriggerChar)
             {
-                // First time or different trigger - call the provider callback to get items
                 try
                 {
-                    // Note: This blocks the UI thread briefly
                     var items = trigger.Provider().GetAwaiter().GetResult();
-                    _completionState = _completionState.Activate(
-                        items,
-                        _inputState.CursorLineIndex,
-                        triggerColumn,
-                        foundTriggerChar,
-                        trigger.Label);
+                    _completionState = _completionState.Activate(items, _inputState.CursorLineIndex, triggerColumn, foundTriggerChar, trigger.Label);
                 }
                 catch (Exception ex)
                 {
-                    // Show error in popup instead of crashing
-                    _completionState = _completionState.ActivateWithError(
-                        $"Error loading items: {ex.Message}",
-                        _inputState.CursorLineIndex,
-                        triggerColumn,
-                        foundTriggerChar,
-                        trigger.Label);
+                    _completionState = _completionState.ActivateWithError($"Error loading items: {ex.Message}", _inputState.CursorLineIndex, triggerColumn, foundTriggerChar, trigger.Label);
                 }
             }
-
-            // Update query (only if not in error state)
             if (!_completionState.IsError)
             {
                 _completionState = _completionState.UpdateQuery(query);
@@ -250,27 +337,15 @@ internal static class InteractiveMode
         }
         else if (_completionState.IsActive)
         {
-            // No longer in completion context - deactivate
             _completionState = _completionState.Deactivate();
         }
     }
 
     private static void InsertSelectedFile(string selectedFile)
     {
-        // Get current state
         var currentLine = _inputState.Lines[_inputState.CursorLineIndex];
         var cursorColumn = _inputState.CursorColumn;
-
-        // Insert the selected item with the appropriate trigger character
-        var newLine = CompletionHelper.InsertCompletion(
-            currentLine,
-            _completionState.TriggerColumn,
-            cursorColumn,
-            _completionState.TriggerChar,
-            selectedFile,
-            out int newCursorColumn);
-
-        // Update the line in the input state
+        var newLine = CompletionHelper.InsertCompletion(currentLine, _completionState.TriggerColumn, cursorColumn, _completionState.TriggerChar, selectedFile, out var newCursorColumn);
         _inputState.SetLine(_inputState.CursorLineIndex, newLine, newCursorColumn);
     }
 
@@ -280,36 +355,33 @@ internal static class InteractiveMode
         var size = _backend.GetSize();
         _terminal.Draw(frame =>
         {
-            int width = size.Width;
-            int height = size.Height;
-            int statusLineHeight = 1;
-            int inputHeight = Math.Max(1, _inputState.Lines.Count);
-            int separators = 2; // lines above and below input
-            int reserved = inputHeight + separators + statusLineHeight;
-            int contentHeight = Math.Max(0, height - reserved);
+            var width = size.Width;
+            var height = size.Height;
+            var statusLineHeight = 1;
+            var inputHeight = Math.Max(1, _inputState.Lines.Count);
+            var separators = 2;
+            var reserved = inputHeight + separators + statusLineHeight;
+            var contentHeight = Math.Max(0, height - reserved);
 
-            // Content area: newest at bottom, oldest truncated at top
             var visibleMessages = _messages.TakeLast(contentHeight).ToList();
-            for (int i = 0; i < contentHeight; i++)
+            for (var i = 0; i < contentHeight; i++)
             {
-                string line = i < visibleMessages.Count ? visibleMessages[i] : string.Empty;
+                var line = i < visibleMessages.Count ? visibleMessages[i] : string.Empty;
                 if (line.Length > width) line = line[..width];
                 frame.WriteString(0, i, line.PadRight(width), Style.Empty);
             }
 
-            int sepAboveInputY = contentHeight;
+            var sepAboveInputY = contentHeight;
             frame.WriteString(0, sepAboveInputY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
 
-            // Use MultiLineInputWidget with state for input area
             var inputRect = new Rect(0, sepAboveInputY + 1, width, inputHeight);
-            new CycoTui.Core.Widgets.MultiLineInputWidget()
+            new MultiLineInputWidget()
                 .WithStyles(Style.Empty, Style.Empty.Add(TextModifier.Invert))
                 .Render(frame, inputRect, _inputState);
 
-            int sepBelowInputY = sepAboveInputY + 1 + inputHeight;
+            var sepBelowInputY = sepAboveInputY + 1 + inputHeight;
             frame.WriteString(0, sepBelowInputY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
 
-            // Render file completion popup if active (overlays content above input)
             if (_completionState.IsActive)
             {
                 var popupWidget = CompletionPopupWidget.Create()
@@ -319,14 +391,12 @@ internal static class InteractiveMode
                         title: Style.Empty.WithForeground(Color.Cyan).Add(TextModifier.Bold),
                         selected: Style.Empty.Add(TextModifier.Invert),
                         item: Style.Empty);
-
                 var popupRect = popupWidget.CalculatePopupRect(inputRect, _completionState, height);
                 popupWidget.Render(frame, popupRect, _completionState);
             }
 
-            // Alt/Cmd+Arrow for word navigation (detected as Alt+Arrow or Alt+B/F)
-            string wordNav = OperatingSystem.IsWindows() ? "Alt+←→" : "Cmd+←→";
-            string status = $"Messages: {_messages.Count}  Line: {_inputState.CursorLineIndex + 1}/{_inputState.Lines.Count}  Col: {_inputState.CursorColumn}  ←→↑↓=Move  {wordNav}=Word  Home/End  Enter=Submit  Ctrl+J=NewLine  Esc=Quit";
+            var wordNav = OperatingSystem.IsWindows() ? "Alt+←→" : "Cmd+←→";
+            var status = $"Messages: {_messages.Count}  Line: {_inputState.CursorLineIndex + 1}/{_inputState.Lines.Count}  Col: {_inputState.CursorColumn}  ←→↑↓=Move  {wordNav}=Word  Home/End  Enter=Submit  Ctrl+J=NewLine  Esc=Quit";
             if (status.Length > width) status = status[..width];
             frame.WriteString(0, sepBelowInputY + 1, status.PadRight(width), Style.Empty.Add(TextModifier.Bold));
         });
