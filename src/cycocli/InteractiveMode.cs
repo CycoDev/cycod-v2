@@ -47,7 +47,7 @@ internal static class InteractiveMode
                 await Task.CompletedTask;
                 return new List<string>
                 {
-                    "exit", "save", "clear", "cost", "help"
+                    "exit"
                 };
             },
             "Commands"
