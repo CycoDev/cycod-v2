@@ -11,6 +11,7 @@ using CycoTui.Core.Style;
 using CycoTui.Core.Layout;
 using CycoTui.Core.Terminal;
 using CycoTui.Core.Widgets;
+using GlowSharp;
 
 namespace CycoTui.Sample;
 
@@ -32,6 +33,7 @@ internal static class InteractiveMode
     private class StyledLine
     {
         public List<(string Text, Style Style)> Segments { get; } = new();
+        public bool IsUserMessage { get; set; }
     }
     private static readonly List<StyledLine> _styledMessages = new();
 
@@ -427,6 +429,29 @@ internal static class InteractiveMode
         sb.Append(remainder);
     }
 
+    private static void AddUserMessage(string text)
+    {
+        lock (_renderLock)
+        {
+            var styled = new StyledLine { IsUserMessage = true };
+            // Apply grey color to user messages
+            var greyStyle = Style.Empty.WithForeground(Color.Rgb(128, 128, 128));
+            styled.Segments.Add((text, greyStyle));
+            _styledMessages.Add(styled);
+            _messages.Add(text);
+
+            // Add empty line after user message
+            var emptyLine = new StyledLine();
+            emptyLine.Segments.Add(("", Style.Empty));
+            _styledMessages.Add(emptyLine);
+            _messages.Add("");
+
+            // Reset assistant message tracking when adding a new message
+            _assistantMessageStartIndex = -1;
+            Render();
+        }
+    }
+
     private static void AddParsedStyledMessage(string raw)
     {
         lock (_renderLock)
@@ -445,8 +470,21 @@ internal static class InteractiveMode
     {
         lock (_renderLock)
         {
-            // Split multi-line messages into separate styled lines
-            var lines = raw.Split('\n');
+            // Strip "Assistant: " prefix if present
+            var content = raw.StartsWith("Assistant: ") ? raw.Substring(11) : raw;
+
+            // Use StreamingMarkdownRenderer to format the content
+            var renderer = new StreamingMarkdownRenderer();
+            var outputBuffer = new System.Text.StringBuilder();
+            renderer.OnOutput += (text) => outputBuffer.Append(text);
+
+            // Process the content through the markdown renderer
+            renderer.AppendChunk(content);
+            renderer.Flush();
+
+            // Get the formatted output and split into lines
+            var formattedContent = outputBuffer.ToString();
+            var lines = formattedContent.Split('\n');
 
             // If we have a previous assistant message group, remove it
             if (_assistantMessageStartIndex >= 0 && _assistantMessageStartIndex < _messages.Count)
@@ -462,12 +500,25 @@ internal static class InteractiveMode
             // Add new message(s) - one per line
             foreach (var line in lines)
             {
-                if (string.IsNullOrEmpty(line)) continue;
+                // Keep empty lines for proper spacing
                 var styled = new StyledLine();
-                foreach (var seg in ParseAnsiSegments(line)) styled.Segments.Add(seg);
+                if (!string.IsNullOrEmpty(line))
+                {
+                    foreach (var seg in ParseAnsiSegments(line)) styled.Segments.Add(seg);
+                }
+                else
+                {
+                    styled.Segments.Add(("", Style.Empty));
+                }
                 _styledMessages.Add(styled);
                 _messages.Add(line);
             }
+
+            // Add empty line after assistant message
+            var emptyLine = new StyledLine();
+            emptyLine.Segments.Add(("", Style.Empty));
+            _styledMessages.Add(emptyLine);
+            _messages.Add("");
 
             Render();
         }
@@ -498,7 +549,7 @@ internal static class InteractiveMode
             }
             else
             {
-                AddParsedStyledMessage($"User: {text}");
+                AddUserMessage(text);
                 TrySendToCycod(text);
             }
         };

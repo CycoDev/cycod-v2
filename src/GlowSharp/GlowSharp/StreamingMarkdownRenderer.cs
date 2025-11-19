@@ -15,9 +15,37 @@ public class StreamingMarkdownRenderer
     private string _codeBlockLanguage = "";
     private readonly List<string> _tableLines = new();
 
+    /// <summary>
+    /// Event triggered when markdown is rendered. Subscribe to this to receive ANSI-formatted output
+    /// instead of writing to Console. If null, output goes to Console.
+    /// </summary>
+    public event Action<string>? OnOutput;
+
     public StreamingMarkdownRenderer(StyleConfig? style = null)
     {
         _style = style ?? StyleConfig.DarkStyle;
+    }
+
+    /// <summary>
+    /// Emit output - either to callback or Console
+    /// </summary>
+    private void Emit(string text)
+    {
+        if (OnOutput != null)
+            OnOutput(text);
+        else
+            Console.Write(text);
+    }
+
+    /// <summary>
+    /// Emit output with newline - either to callback or Console
+    /// </summary>
+    private void EmitLine(string text = "")
+    {
+        if (OnOutput != null)
+            OnOutput(text + "\n");
+        else
+            Console.WriteLine(text);
     }
 
     /// <summary>
@@ -295,7 +323,7 @@ public class StreamingMarkdownRenderer
 
         // Apply basic formatting
         var formatted = FormatInlineText(text);
-        Console.Write(formatted);
+        Emit(formatted);
     }
 
     private string FormatInlineText(string text)
@@ -362,7 +390,7 @@ public class StreamingMarkdownRenderer
     private void RenderCodeBlock()
     {
         var code = _blockBuffer.ToString();
-        Console.WriteLine(); // Margin before
+        EmitLine(); // Margin before
 
         var highlighted = SyntaxHighlighter.Highlight(code, _codeBlockLanguage, _style.CodeBlock.Theme);
         var lines = highlighted.Split('\n');
@@ -371,27 +399,27 @@ public class StreamingMarkdownRenderer
         {
             if (!string.IsNullOrEmpty(line))
             {
-                Console.Write("  "); // Indent
+                Emit("  "); // Indent
             }
-            Console.WriteLine(line);
+            EmitLine(line);
         }
 
-        Console.WriteLine(); // Margin after
+        EmitLine(); // Margin after
     }
 
     private void RenderHorizontalRule()
     {
         // Render a horizontal line using Unicode box-drawing characters
         var rule = new string('─', 80);
-        Console.WriteLine($"\u001b[90m{rule}\u001b[0m"); // Gray color
-        Console.WriteLine();
+        EmitLine($"\u001b[90m{rule}\u001b[0m"); // Gray color
+        EmitLine();
     }
 
     private void RenderTable()
     {
         if (_tableLines.Count == 0) return;
 
-        Console.WriteLine();
+        EmitLine();
 
         // Parse table structure
         var rows = new List<List<string>>();
@@ -435,51 +463,51 @@ public class StreamingMarkdownRenderer
         // Render header
         if (rows.Count > 0)
         {
-            Console.Write("  ");
+            var headerLine = new StringBuilder("  ");
             for (int col = 0; col < columnCount; col++)
             {
                 var cell = col < rows[0].Count ? rows[0][col] : "";
-                Console.Write("\u001b[1m");
-                Console.Write(cell.PadRight(columnWidths[col]));
-                Console.Write("\u001b[0m");
+                headerLine.Append("\u001b[1m");
+                headerLine.Append(cell.PadRight(columnWidths[col]));
+                headerLine.Append("\u001b[0m");
                 if (col < columnCount - 1)
                 {
-                    Console.Write(" │ ");
+                    headerLine.Append(" │ ");
                 }
             }
-            Console.WriteLine();
+            EmitLine(headerLine.ToString());
 
             // Separator
-            Console.Write("  ");
+            var separatorLine = new StringBuilder("  ");
             for (int col = 0; col < columnCount; col++)
             {
-                Console.Write(new string('─', columnWidths[col]));
+                separatorLine.Append(new string('─', columnWidths[col]));
                 if (col < columnCount - 1)
                 {
-                    Console.Write("─┼─");
+                    separatorLine.Append("─┼─");
                 }
             }
-            Console.WriteLine();
+            EmitLine(separatorLine.ToString());
         }
 
         // Render data rows
         for (int rowIdx = 1; rowIdx < rows.Count; rowIdx++)
         {
-            Console.Write("  ");
+            var dataLine = new StringBuilder("  ");
             var row = rows[rowIdx];
             for (int col = 0; col < columnCount; col++)
             {
                 var cell = col < row.Count ? row[col] : "";
-                Console.Write(cell.PadRight(columnWidths[col]));
+                dataLine.Append(cell.PadRight(columnWidths[col]));
                 if (col < columnCount - 1)
                 {
-                    Console.Write(" │ ");
+                    dataLine.Append(" │ ");
                 }
             }
-            Console.WriteLine();
+            EmitLine(dataLine.ToString());
         }
 
-        Console.WriteLine();
+        EmitLine();
     }
 
     private void FlushBlockBuffer()

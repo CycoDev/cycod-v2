@@ -12,6 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="../CycoTui.Core/CycoTui.Core.csproj" />
     <ProjectReference Include="../common/common.csproj" />
+    <ProjectReference Include="../GlowSharp/GlowSharp/GlowSharp.csproj" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../CycoTui.Backend.Unix/CycoTui.Backend.Unix.csproj" />
