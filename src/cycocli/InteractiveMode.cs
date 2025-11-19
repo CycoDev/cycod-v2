@@ -23,6 +23,7 @@ internal static class InteractiveMode
     private static string? _cachedGitBranch;
     private static string? _cachedCurrentLLM;
     private static int _assistantMessageStartIndex = -1;
+    private static int _messagesWrittenToScrollback = 0;
 
     private static readonly List<string> _messages = new();
     // Debug area removed; retaining stub methods only
@@ -492,6 +493,12 @@ internal static class InteractiveMode
                 int removeCount = _messages.Count - _assistantMessageStartIndex;
                 _messages.RemoveRange(_assistantMessageStartIndex, removeCount);
                 _styledMessages.RemoveRange(_assistantMessageStartIndex, removeCount);
+
+                // Adjust scrollback tracking when removing messages
+                if (_messagesWrittenToScrollback > _assistantMessageStartIndex)
+                {
+                    _messagesWrittenToScrollback = _assistantMessageStartIndex;
+                }
             }
 
             // Mark the start of this assistant message group
@@ -799,6 +806,34 @@ internal static class InteractiveMode
     {
         if (_backend == null || _terminal == null) return;
         var size = _backend.GetSize();
+
+        // Write new messages to scrollback buffer before rendering current viewport
+        var messagesToWriteToScrollback = _styledMessages.Count - _messagesWrittenToScrollback;
+        if (messagesToWriteToScrollback > 0)
+        {
+            // Get the messages we haven't written yet
+            var newMessages = _styledMessages.Skip(_messagesWrittenToScrollback).Take(messagesToWriteToScrollback).ToList();
+
+            // Position cursor and write each message line
+            foreach (var styledLine in newMessages)
+            {
+                // Build the line with ANSI styling
+                var sb = new System.Text.StringBuilder();
+                foreach (var (text, style) in styledLine.Segments)
+                {
+                    // Convert CycoTui Style to ANSI codes
+                    sb.Append(StyleToAnsi(style));
+                    sb.Append(text);
+                    sb.Append("\u001b[0m"); // Reset after each segment
+                }
+
+                // Write the line directly to the console, letting it scroll naturally
+                Console.WriteLine(sb.ToString());
+            }
+
+            _messagesWrittenToScrollback = _styledMessages.Count;
+        }
+
         _terminal.Draw(frame =>
         {
             var width = size.Width;
@@ -949,6 +984,45 @@ internal static class InteractiveMode
                 popupWidget.Render(frame, popupRect, _completionState);
             }
         });
+    }
+
+    private static string StyleToAnsi(Style style)
+    {
+        var sb = new System.Text.StringBuilder();
+
+        // Handle foreground color
+        if (style.Foreground != null)
+        {
+            var fg = style.Foreground.Value;
+            if (fg.R >= 0 && fg.G >= 0 && fg.B >= 0)
+            {
+                sb.Append($"\u001b[38;2;{fg.R};{fg.G};{fg.B}m");
+            }
+        }
+
+        // Handle background color
+        if (style.Background != null)
+        {
+            var bg = style.Background.Value;
+            if (bg.R >= 0 && bg.G >= 0 && bg.B >= 0)
+            {
+                sb.Append($"\u001b[48;2;{bg.R};{bg.G};{bg.B}m");
+            }
+        }
+
+        // Handle text modifiers (use AddModifier property)
+        if (style.AddModifier.HasFlag(TextModifier.Bold))
+            sb.Append("\u001b[1m");
+        if (style.AddModifier.HasFlag(TextModifier.Dim))
+            sb.Append("\u001b[2m");
+        if (style.AddModifier.HasFlag(TextModifier.Italic))
+            sb.Append("\u001b[3m");
+        if (style.AddModifier.HasFlag(TextModifier.Underline))
+            sb.Append("\u001b[4m");
+        if (style.AddModifier.HasFlag(TextModifier.Invert))
+            sb.Append("\u001b[7m");
+
+        return sb.ToString();
     }
 }
 
