@@ -28,7 +28,6 @@ internal static class InteractiveMode
     // Debug area removed; retaining stub methods only
     private static readonly MultiLineInputState _inputState = new();
     private static CompletionState _completionState = CompletionState.CreateInactive();
-    private static int _scrollOffset = 0; // 0 = showing latest messages, >0 = scrolled up
 
     // ANSI styled lines
     private class StyledLine
@@ -430,27 +429,53 @@ internal static class InteractiveMode
         sb.Append(remainder);
     }
 
+    // Track if we're waiting for a response (showing dots)
+    private static bool _waitingForResponse = false;
+    private static System.Threading.Timer? _dotTimer;
+    private static int _dotCount = 0;
+
     private static void AddUserMessage(string text)
     {
         lock (_renderLock)
         {
-            var styled = new StyledLine { IsUserMessage = true };
-            // Apply grey color to user messages
-            var greyStyle = Style.Empty.WithForeground(Color.Rgb(128, 128, 128));
-            styled.Segments.Add((text, greyStyle));
-            _styledMessages.Add(styled);
-            _messages.Add(text);
-            _scrollOffset = 0; // Auto-scroll to bottom when new message is added
+            if (_backend == null) return;
 
-            // Add empty line after user message
-            var emptyLine = new StyledLine();
-            emptyLine.Segments.Add(("", Style.Empty));
-            _styledMessages.Add(emptyLine);
-            _messages.Add("");
+            // Step 1: Clear everything EXCEPT the upper separator line
+            // Use same calculation as Render() for consistency
+            var size = _backend.GetSize();
+            var height = size.Height;
 
-            // Reset assistant message tracking when adding a new message
-            _assistantMessageStartIndex = -1;
-            Render();
+            // Warp terminal adjustment (must match Render())
+            var isWarp = Environment.GetEnvironmentVariable("TERM_PROGRAM")?.Contains("WarpTerminal") == true
+                      || Environment.GetEnvironmentVariable("WARP_SESSION_ID") != null
+                      || Environment.GetEnvironmentVariable("WARP_IS_LOCAL_SHELL_SESSION") != null;
+            if (isWarp && height > 2) height -= 2;
+
+            var inputHeight = Math.Max(1, _inputState.Lines.Count);
+            var reserved = 1 + inputHeight + 1 + 1 + 1; // upper_sep + input + lower_sep + status + padding
+            var upperSepY = height - reserved; // 0-indexed row of upper separator
+            var inputY = upperSepY + 1; // 0-indexed row of input line
+            // Move to input row (convert to 1-indexed for ANSI) and clear from there
+            _backend.WriteRaw($"\u001b[{inputY + 1};1H"); // +1 for 1-indexed ANSI
+            _backend.WriteRaw("\u001b[J"); // Clear from cursor to end of screen
+
+            // Step 2: Print user's input (dimmed/grey)
+            Console.WriteLine($"\u001b[90m  {text}\u001b[0m"); // Grey color, 2-space margin
+
+            // Step 3: Start showing dots
+            _waitingForResponse = true;
+            _dotCount = 0;
+            Console.Write("  "); // 2-space margin for dots
+
+            // Start a timer to add dots every second
+            _dotTimer = new System.Threading.Timer(_ =>
+            {
+                if (_waitingForResponse && _dotCount < 10)
+                {
+                    Console.Write(".");
+                    _dotCount++;
+                }
+            }, null, 1000, 1000);
         }
     }
 
@@ -462,7 +487,6 @@ internal static class InteractiveMode
             foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
             _styledMessages.Add(styled);
             _messages.Add(raw);
-            _scrollOffset = 0; // Auto-scroll to bottom when new message is added
             // Reset assistant message tracking when adding a new message (typically user input)
             _assistantMessageStartIndex = -1;
             Render();
@@ -473,6 +497,18 @@ internal static class InteractiveMode
     {
         lock (_renderLock)
         {
+            // Stop the dot timer and erase the dots line
+            if (_waitingForResponse)
+            {
+                _waitingForResponse = false;
+                _dotTimer?.Dispose();
+                _dotTimer = null;
+
+                // Erase the dots line: move to beginning of current line and clear it
+                Console.Write("\u001b[2K"); // Clear entire current line
+                Console.Write("\r"); // Move cursor to beginning of line
+            }
+
             // Strip "Assistant: " prefix if present
             var content = raw.StartsWith("Assistant: ") ? raw.Substring(11) : raw;
 
@@ -485,44 +521,24 @@ internal static class InteractiveMode
             renderer.AppendChunk(content);
             renderer.Flush();
 
-            // Get the formatted output and split into lines
+            // Get the formatted output and print it
             var formattedContent = outputBuffer.ToString();
-            var lines = formattedContent.Split('\n');
-
-            // If we have a previous assistant message group, remove it
-            if (_assistantMessageStartIndex >= 0 && _assistantMessageStartIndex < _messages.Count)
+            foreach (var line in formattedContent.Split('\n'))
             {
-                int removeCount = _messages.Count - _assistantMessageStartIndex;
-                _messages.RemoveRange(_assistantMessageStartIndex, removeCount);
-                _styledMessages.RemoveRange(_assistantMessageStartIndex, removeCount);
+                Console.WriteLine($"  {line}"); // 2-space margin
             }
 
-            // Mark the start of this assistant message group
-            _assistantMessageStartIndex = _messages.Count;
-
-            // Add new message(s) - one per line
-            foreach (var line in lines)
+            // Print blank lines to push content into scrollback, then Render() draws input area
+            // This ensures our content is above the viewport and Render() doesn't overwrite it
+            var size = _backend?.GetSize();
+            var height = size?.Height ?? 24;
+            var reserved = 5; // upper_sep + input + lower_sep + status + padding
+            for (int i = 0; i < reserved; i++)
             {
-                // Keep empty lines for proper spacing
-                var styled = new StyledLine();
-                if (!string.IsNullOrEmpty(line))
-                {
-                    foreach (var seg in ParseAnsiSegments(line)) styled.Segments.Add(seg);
-                }
-                else
-                {
-                    styled.Segments.Add(("", Style.Empty));
-                }
-                _styledMessages.Add(styled);
-                _messages.Add(line);
+                Console.WriteLine();
             }
 
-            // Add empty line after assistant message
-            var emptyLine = new StyledLine();
-            emptyLine.Segments.Add(("", Style.Empty));
-            _styledMessages.Add(emptyLine);
-            _messages.Add("");
-
+            // Now call Render() to draw the input area at the bottom
             Render();
         }
     }
@@ -559,12 +575,8 @@ internal static class InteractiveMode
 
         _backend = CreateBackend();
 
-        // Enter alternate screen buffer - this prevents native terminal scrolling
-        // so all scrolling must go through our app-managed Page Up/Down
-        _backend.WriteRaw("\u001b[?1049h");
-
-        _backend.Clear();
-        _backend.SetCursorPosition(new Position(0, 0));
+        // Don't use alternate screen buffer - we want native terminal scrolling
+        // Content is "committed" to terminal scrollback, input/status float at bottom
         _backend.HideCursor();
         _terminal = new Terminal(_backend, new LoggingContext(null));
 
@@ -577,11 +589,70 @@ internal static class InteractiveMode
         }
         finally
         {
-            // Exit alternate screen buffer and restore previous screen
-            _backend?.WriteRaw("\u001b[?1049l");
+            // Clear the input/status area before exiting
+            ClearInputStatusArea();
+            _backend?.ShowCursor();
             _terminal?.Dispose();
             _backend?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Calculates the height of the input/status area (separators + input + status + padding)
+    /// </summary>
+    private static int GetInputStatusAreaHeight()
+    {
+        var inputHeight = Math.Max(1, _inputState.Lines.Count);
+        return 1 + inputHeight + 1 + 1 + 2; // upper sep + input + lower sep + status + 2 padding lines
+    }
+
+    /// <summary>
+    /// Clears the input/status area using absolute cursor positioning
+    /// </summary>
+    private static void ClearInputStatusArea()
+    {
+        if (_backend == null) return;
+        var size = _backend.GetSize();
+        var areaHeight = GetInputStatusAreaHeight();
+
+        // Calculate the row where input/status area starts (1-indexed for ANSI)
+        var startRow = size.Height - areaHeight + 1;
+
+        // Move cursor to start of input/status area (absolute positioning)
+        _backend.WriteRaw($"\u001b[{startRow};1H"); // Move to row, column 1
+        _backend.WriteRaw("\u001b[J"); // Clear from cursor to end of screen
+    }
+
+    /// <summary>
+    /// Commits finalized content to the terminal scrollback, then redraws input/status
+    /// </summary>
+    private static void CommitToTerminal(string content, Style style)
+    {
+        if (_backend == null) return;
+        var size = _backend.GetSize();
+        var areaHeight = GetInputStatusAreaHeight();
+
+        // Calculate the row where scrollable area ends (1-indexed for ANSI)
+        var scrollEndRow = size.Height - areaHeight;
+
+        // Set scroll region to exclude input/status area
+        _backend.WriteRaw($"\u001b[1;{scrollEndRow}r"); // Set scroll region rows 1 to scrollEndRow
+
+        // Move cursor to bottom of scroll region
+        _backend.WriteRaw($"\u001b[{scrollEndRow};1H");
+
+        // Print the content to terminal (scrolls within the region)
+        var ansiStyle = StyleToAnsi(style);
+        foreach (var line in content.Split('\n'))
+        {
+            Console.WriteLine($"  {ansiStyle}{line}\u001b[0m"); // 2-space left margin
+        }
+
+        // Reset scroll region to full screen
+        _backend.WriteRaw("\u001b[r");
+
+        // Redraw input/status area (it wasn't affected by scrolling)
+        Render();
     }
 
     private static ITerminalBackend CreateBackend() => OperatingSystem.IsWindows()
@@ -730,24 +801,16 @@ internal static class InteractiveMode
                 }
             }
 
-            // Handle Page Up/Down for scrolling messages area
-            if (key.Key == ConsoleKey.PageUp)
-            {
-                _scrollOffset += 10;
-                Render();
-                continue;
-            }
-            if (key.Key == ConsoleKey.PageDown)
-            {
-                _scrollOffset = Math.Max(0, _scrollOffset - 10);
-                Render();
-                continue;
-            }
+            // Note: Page Up/Down not needed - native terminal scrolling handles history
 
             if (_inputState.HandleKey(key))
             {
                 UpdateCompletionState();
-                Render();
+                // Don't render while waiting for response - we're showing dots
+                if (!_waitingForResponse)
+                {
+                    Render();
+                }
             }
         }
     }
@@ -856,45 +919,12 @@ internal static class InteractiveMode
             var reserved = bottomPaddingHeight + statusLineHeight + lowerSeparatorHeight + inputHeight + upperSeparatorHeight;
             var messagesHeight = Math.Max(0, height - reserved);
 
-            // Messages area (top, rows 0 to messagesHeight-1)
-            // Use scroll offset to show older messages when user scrolls up
-            var messagesStartY = 0;
-            var totalMessages = _styledMessages.Count;
+            // NOTE: We do NOT render a "messages area" here.
+            // All content (user messages and LLM responses) is committed to terminal scrollback.
+            // We only render the input/status area at the bottom.
 
-            // Clamp scroll offset to valid range
-            var maxScrollOffset = Math.Max(0, totalMessages - messagesHeight);
-            _scrollOffset = Math.Clamp(_scrollOffset, 0, maxScrollOffset);
-
-            // Calculate which messages to show based on scroll offset
-            var startIndex = Math.Max(0, totalMessages - messagesHeight - _scrollOffset);
-            var styledVisible = _styledMessages.Skip(startIndex).Take(messagesHeight).ToList();
-            int messageCount = styledVisible.Count;
-            int startRow = Math.Max(0, messagesHeight - messageCount);
-
-            // Clear messages area
-            for (var r = 0; r < messagesHeight; r++)
-                frame.WriteString(0, messagesStartY + r, new string(' ', width), Style.Empty);
-
-            // Render messages bottom-aligned within their area (with left margin)
-            for (var row = 0; row < messageCount; row++)
-            {
-                var styledLine = styledVisible[row];
-                int col = leftMargin;
-                foreach (var (text, style) in styledLine.Segments)
-                {
-                    if (col >= width) break;
-                    var remaining = width - col;
-                    var segmentText = text.Length > remaining ? text[..remaining] : text;
-                    frame.WriteString(col, messagesStartY + startRow + row, segmentText, style);
-                    col += segmentText.Length;
-                }
-                if (col < width)
-                    frame.WriteString(col, messagesStartY + startRow + row, new string(' ', width - col), Style.Empty);
-            }
-
-            // Clear the entire lower section (from upper separator to bottom) to ensure
-            // old input content is properly cleared when input height changes
-            var upperSepY = messagesHeight;
+            // Calculate where input/status area starts
+            var upperSepY = height - reserved;
             for (var r = upperSepY; r < height; r++)
             {
                 frame.WriteString(0, r, new string(' ', width), Style.Empty);
@@ -903,9 +933,12 @@ internal static class InteractiveMode
             // Upper separator (above input) - with left margin
             frame.WriteString(leftMargin, upperSepY, new string('─', contentWidth), Style.Empty.Add(TextModifier.Dim));
 
-            // Input area - with left margin
+            // Input area - with left margin and prompt
             var inputY = upperSepY + 1;
-            var inputRect = new Rect(leftMargin, inputY, contentWidth, inputHeight);
+            // Draw prompt character
+            frame.WriteString(leftMargin, inputY, "> ", Style.Empty);
+            // Input area starts after prompt
+            var inputRect = new Rect(leftMargin + 2, inputY, contentWidth - 2, inputHeight);
             new MultiLineInputWidget().WithStyles(Style.Empty, Style.Empty.Add(TextModifier.Invert)).Render(frame, inputRect, _inputState);
 
             // Lower separator (below input, above status) - with left margin
