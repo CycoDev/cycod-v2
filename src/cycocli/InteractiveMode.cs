@@ -23,12 +23,12 @@ internal static class InteractiveMode
     private static string? _cachedGitBranch;
     private static string? _cachedCurrentLLM;
     private static int _assistantMessageStartIndex = -1;
-    private static int _messagesWrittenToScrollback = 0;
 
     private static readonly List<string> _messages = new();
     // Debug area removed; retaining stub methods only
     private static readonly MultiLineInputState _inputState = new();
     private static CompletionState _completionState = CompletionState.CreateInactive();
+    private static int _scrollOffset = 0; // 0 = showing latest messages, >0 = scrolled up
 
     // ANSI styled lines
     private class StyledLine
@@ -440,6 +440,7 @@ internal static class InteractiveMode
             styled.Segments.Add((text, greyStyle));
             _styledMessages.Add(styled);
             _messages.Add(text);
+            _scrollOffset = 0; // Auto-scroll to bottom when new message is added
 
             // Add empty line after user message
             var emptyLine = new StyledLine();
@@ -461,6 +462,7 @@ internal static class InteractiveMode
             foreach (var seg in ParseAnsiSegments(raw)) styled.Segments.Add(seg);
             _styledMessages.Add(styled);
             _messages.Add(raw);
+            _scrollOffset = 0; // Auto-scroll to bottom when new message is added
             // Reset assistant message tracking when adding a new message (typically user input)
             _assistantMessageStartIndex = -1;
             Render();
@@ -493,12 +495,6 @@ internal static class InteractiveMode
                 int removeCount = _messages.Count - _assistantMessageStartIndex;
                 _messages.RemoveRange(_assistantMessageStartIndex, removeCount);
                 _styledMessages.RemoveRange(_assistantMessageStartIndex, removeCount);
-
-                // Adjust scrollback tracking when removing messages
-                if (_messagesWrittenToScrollback > _assistantMessageStartIndex)
-                {
-                    _messagesWrittenToScrollback = _assistantMessageStartIndex;
-                }
             }
 
             // Mark the start of this assistant message group
@@ -562,6 +558,11 @@ internal static class InteractiveMode
         };
 
         _backend = CreateBackend();
+
+        // Enter alternate screen buffer - this prevents native terminal scrolling
+        // so all scrolling must go through our app-managed Page Up/Down
+        _backend.WriteRaw("\u001b[?1049h");
+
         _backend.Clear();
         _backend.SetCursorPosition(new Position(0, 0));
         _backend.HideCursor();
@@ -576,6 +577,8 @@ internal static class InteractiveMode
         }
         finally
         {
+            // Exit alternate screen buffer and restore previous screen
+            _backend?.WriteRaw("\u001b[?1049l");
             _terminal?.Dispose();
             _backend?.Dispose();
         }
@@ -727,6 +730,20 @@ internal static class InteractiveMode
                 }
             }
 
+            // Handle Page Up/Down for scrolling messages area
+            if (key.Key == ConsoleKey.PageUp)
+            {
+                _scrollOffset += 10;
+                Render();
+                continue;
+            }
+            if (key.Key == ConsoleKey.PageDown)
+            {
+                _scrollOffset = Math.Max(0, _scrollOffset - 10);
+                Render();
+                continue;
+            }
+
             if (_inputState.HandleKey(key))
             {
                 UpdateCompletionState();
@@ -807,32 +824,10 @@ internal static class InteractiveMode
         if (_backend == null || _terminal == null) return;
         var size = _backend.GetSize();
 
-        // Write new messages to scrollback buffer before rendering current viewport
-        var messagesToWriteToScrollback = _styledMessages.Count - _messagesWrittenToScrollback;
-        if (messagesToWriteToScrollback > 0)
-        {
-            // Get the messages we haven't written yet
-            var newMessages = _styledMessages.Skip(_messagesWrittenToScrollback).Take(messagesToWriteToScrollback).ToList();
-
-            // Position cursor and write each message line
-            foreach (var styledLine in newMessages)
-            {
-                // Build the line with ANSI styling
-                var sb = new System.Text.StringBuilder();
-                foreach (var (text, style) in styledLine.Segments)
-                {
-                    // Convert CycoTui Style to ANSI codes
-                    sb.Append(StyleToAnsi(style));
-                    sb.Append(text);
-                    sb.Append("\u001b[0m"); // Reset after each segment
-                }
-
-                // Write the line directly to the console, letting it scroll naturally
-                Console.WriteLine(sb.ToString());
-            }
-
-            _messagesWrittenToScrollback = _styledMessages.Count;
-        }
+        // Note: Scrollback buffer writing via Console.WriteLine() has been disabled
+        // because it conflicts with Terminal.Draw() rendering. Messages are displayed
+        // in the messages area rendered by Terminal.Draw() instead.
+        // TODO: Re-implement scrollback support using a scroll region or alternate buffer
 
         _terminal.Draw(frame =>
         {
@@ -848,6 +843,10 @@ internal static class InteractiveMode
             // Subtract 2 to ensure proper spacing at bottom
             if (isWarp && height > 2) height -= 2;
 
+            // Left margin for better readability
+            const int leftMargin = 2;
+            var contentWidth = width - leftMargin;
+
             // Layout calculation (from bottom up, like Claude Code)
             var bottomPaddingHeight = 1; // Empty line at very bottom
             var statusLineHeight = 1;
@@ -858,8 +857,17 @@ internal static class InteractiveMode
             var messagesHeight = Math.Max(0, height - reserved);
 
             // Messages area (top, rows 0 to messagesHeight-1)
+            // Use scroll offset to show older messages when user scrolls up
             var messagesStartY = 0;
-            var styledVisible = _styledMessages.TakeLast(messagesHeight).ToList();
+            var totalMessages = _styledMessages.Count;
+
+            // Clamp scroll offset to valid range
+            var maxScrollOffset = Math.Max(0, totalMessages - messagesHeight);
+            _scrollOffset = Math.Clamp(_scrollOffset, 0, maxScrollOffset);
+
+            // Calculate which messages to show based on scroll offset
+            var startIndex = Math.Max(0, totalMessages - messagesHeight - _scrollOffset);
+            var styledVisible = _styledMessages.Skip(startIndex).Take(messagesHeight).ToList();
             int messageCount = styledVisible.Count;
             int startRow = Math.Max(0, messagesHeight - messageCount);
 
@@ -867,11 +875,11 @@ internal static class InteractiveMode
             for (var r = 0; r < messagesHeight; r++)
                 frame.WriteString(0, messagesStartY + r, new string(' ', width), Style.Empty);
 
-            // Render messages bottom-aligned within their area
+            // Render messages bottom-aligned within their area (with left margin)
             for (var row = 0; row < messageCount; row++)
             {
                 var styledLine = styledVisible[row];
-                int col = 0;
+                int col = leftMargin;
                 foreach (var (text, style) in styledLine.Segments)
                 {
                     if (col >= width) break;
@@ -884,18 +892,25 @@ internal static class InteractiveMode
                     frame.WriteString(col, messagesStartY + startRow + row, new string(' ', width - col), Style.Empty);
             }
 
-            // Upper separator (above input)
+            // Clear the entire lower section (from upper separator to bottom) to ensure
+            // old input content is properly cleared when input height changes
             var upperSepY = messagesHeight;
-            frame.WriteString(0, upperSepY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
+            for (var r = upperSepY; r < height; r++)
+            {
+                frame.WriteString(0, r, new string(' ', width), Style.Empty);
+            }
 
-            // Input area
+            // Upper separator (above input) - with left margin
+            frame.WriteString(leftMargin, upperSepY, new string('─', contentWidth), Style.Empty.Add(TextModifier.Dim));
+
+            // Input area - with left margin
             var inputY = upperSepY + 1;
-            var inputRect = new Rect(0, inputY, width, inputHeight);
+            var inputRect = new Rect(leftMargin, inputY, contentWidth, inputHeight);
             new MultiLineInputWidget().WithStyles(Style.Empty, Style.Empty.Add(TextModifier.Invert)).Render(frame, inputRect, _inputState);
 
-            // Lower separator (below input, above status)
+            // Lower separator (below input, above status) - with left margin
             var lowerSepY = inputY + inputHeight;
-            frame.WriteString(0, lowerSepY, new string('─', width), Style.Empty.Add(TextModifier.Dim));
+            frame.WriteString(leftMargin, lowerSepY, new string('─', contentWidth), Style.Empty.Add(TextModifier.Dim));
 
             // Status line (one row above the bottom)
             var statusY = lowerSepY + 1;
@@ -919,12 +934,12 @@ internal static class InteractiveMode
             var totalLength = parts.Sum(p => p.text.Length) + (separator.Length * (parts.Count - 1));
 
             // Truncate path if needed
-            if (totalLength > width && parts.Count > 0)
+            if (totalLength > contentWidth && parts.Count > 0)
             {
                 var pathIndex = parts.Count - 1;
                 var pathPart = parts[pathIndex].text;
                 var otherPartsLength = parts.Take(pathIndex).Sum(p => p.text.Length) + (separator.Length * (parts.Count - 1));
-                var availableForPath = width - otherPartsLength;
+                var availableForPath = contentWidth - otherPartsLength;
 
                 if (availableForPath > 10)
                 {
@@ -937,8 +952,8 @@ internal static class InteractiveMode
                 }
             }
 
-            // Render each part with its color
-            int statusCol = 0;
+            // Render each part with its color - with left margin
+            int statusCol = leftMargin;
             for (int i = 0; i < parts.Count; i++)
             {
                 if (statusCol >= width) break;
